@@ -17,6 +17,16 @@
 
 ---
 
+## 💡 Why Desktopcast?
+
+While Tidal and other streaming apps offer "Connect" features for Yamaha receivers, **many older MusicCast receivers are no longer supported** — leaving users without a proper desktop app to browse and control their music.
+
+Some third-party solutions exist, but they're often paid, closed-source, or limited in functionality. **I believe there should be a free, open-source option available to everyone.**
+
+Desktopcast is my answer to this problem: a lightweight, open-source desktop controller that works with any Yamaha receiver supporting the MusicCast/YXC API — no matter how old.
+
+---
+
 ## ✨ Features
 
 - 🎛️ **Full Receiver Control** - Power, volume, and input selection
@@ -45,7 +55,7 @@
 
 ```bash
 # Clone the repository
-git clone https://github.com/YOUR_USERNAME/Desktopcast.git
+git clone https://github.com/incubodac/Desktopcast.git
 cd Desktopcast
 
 # Create a virtual environment (recommended)
@@ -61,7 +71,7 @@ python main.py
 
 ### Option 2: Download release (coming soon)
 
-Pre-built binaries for Windows, macOS, and Linux will be available in the [Releases](https://github.com/YOUR_USERNAME/Desktopcast/releases) section.
+Pre-built binaries for Windows, macOS, and Linux will be available in the [Releases](https://github.com/incubodac/Desktopcast/releases) section.
 
 ## 🎮 Usage
 
@@ -131,8 +141,8 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## 📬 Support
 
-- 🐛 Found a bug? [Open an issue](https://github.com/YOUR_USERNAME/Desktopcast/issues)
-- 💡 Have an idea? [Start a discussion](https://github.com/YOUR_USERNAME/Desktopcast/discussions)
+- 🐛 Found a bug? [Open an issue](https://github.com/incubodac/Desktopcast/issues)
+- 💡 Have an idea? [Start a discussion](https://github.com/incubodac/Desktopcast/discussions)
 - ⭐ Like this project? Give it a star!
 
 ---

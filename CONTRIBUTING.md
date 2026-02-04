@@ -40,7 +40,7 @@ Enhancement suggestions are welcome! Please provide:
 
 ```bash
 # Clone your fork
-git clone https://github.com/YOUR_USERNAME/Desktopcast.git
+git clone https://github.com/incubodac/Desktopcast.git
 cd Desktopcast
 
 # Create virtual environment
