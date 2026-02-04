@@ -43,6 +43,16 @@ Desktopcast is my answer to this problem: a lightweight, open-source desktop con
 <!-- Add screenshots here -->
 <!-- ![Main Window](screenshots/main.png) -->
 
+## ⚠️ Current Status
+
+> **Note:** This project is in active development.
+
+- ✅ **Tested on:** Yamaha RX-A602 (R602N)
+- ⚠️ **Streaming services:** Tidal is fully functional; other services (Spotify, Deezer, Qobuz, etc.) may have limited functionality
+- 🔄 **Coming soon:** Support for additional Yamaha models and potentially other receiver brands
+
+If you have a different Yamaha model and want to help test, please [open an issue](https://github.com/incubodac/Desktopcast/issues) with your model name and any compatibility notes!
+
 ## 🚀 Installation
 
 ### Prerequisites
