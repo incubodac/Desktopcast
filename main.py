@@ -254,7 +254,7 @@ class Worker(QObject):
 # MAIN APPLICATION
 # =============================================================================
 
-class MusicCastApp(QMainWindow):
+class DesktopCastApp(QMainWindow):
     """Main application window"""
     
     # Signals for thread-safe UI updates
@@ -1629,6 +1629,6 @@ class MusicCastApp(QMainWindow):
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    window = MusicCastApp()
+    window = DesktopCastApp()
     window.show()
     sys.exit(app.exec())
