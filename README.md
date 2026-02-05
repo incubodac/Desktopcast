@@ -40,8 +40,7 @@ Desktopcast is my answer to this problem: a lightweight, open-source desktop con
 
 ## 📸 Screenshots
 
-<!-- Add screenshots here -->
-<!-- ![Main Window](screenshots/main.png) -->
+![Main Window](screenshots/main.png)
 
 ## ⚠️ Current Status
 
