@@ -45,7 +45,9 @@ cd Desktopcast
 
 # Create virtual environment
 python -m venv venv
-source venv/bin/activate  # Windows: venv\Scripts\activate
+source venv/bin/activate         # bash / zsh
+# source venv/bin/activate.fish  # fish
+# venv\Scripts\activate          # Windows
 
 # Install dependencies
 pip install -r requirements.txt

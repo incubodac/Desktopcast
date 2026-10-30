@@ -69,7 +69,12 @@ cd Desktopcast
 
 # Create a virtual environment (recommended)
 python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
+
+# Activate it (use the line for your shell)
+source venv/bin/activate           # bash / zsh
+# source venv/bin/activate.fish    # fish
+# source venv/bin/activate.csh     # csh / tcsh
+# venv\Scripts\activate            # Windows
 
 # Install dependencies
 pip install -r requirements.txt
@@ -77,6 +82,10 @@ pip install -r requirements.txt
 # Run the application
 python main.py
 ```
+
+> **Tip:** If you'd rather not activate the venv, call its interpreter directly:
+> `./venv/bin/pip install -r requirements.txt` and `./venv/bin/python main.py`
+> (on Windows: `venv\Scripts\pip` and `venv\Scripts\python`).
 
 ### Option 2: Download release (coming soon)
 
