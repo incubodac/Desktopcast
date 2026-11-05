@@ -112,8 +112,11 @@ Pre-built binaries for Windows, macOS, and Linux will be available in the [Relea
 
 4. **Manage your queue**
    - Click "Playlist Mode" to show the queue beside the browser
-   - Double-click a song or album to add it; double-click a queue entry to play it
-   - Select an entry and press Delete (or "Remove") to take it out
+   - Double-click a song, album or playlist to add it; double-click a queue entry to play it
+   - Songs in search results can't be queued by the receiver itself, so the app finds the same song in the artist's top tracks or in its album (matched by the album cover) and adds that one. This takes a few seconds; the status line shows where it was found
+   - Outside Playlist Mode, double-click plays a song right away through the queue (it's inserted after the current song), so the queue is kept. Only what the queue can't hold (radio, recent items, presets, a song the app can't find in an album) plays straight from the list; the receiver then drops its queue, so the app asks first
+   - Select entries (Shift/Cmd-click for several) and press Delete or "Remove" to take them out; "🧹 Clear" empties the whole queue
+   - The receiver's queue holds at most 200 tracks (adding a long Tidal playlist fills it). When it's full the app says so instead of adding
    - If the receiver wipes the queue, the panel says so and shows the last command sent before it
    - Use "Recent" for recently played items
    - Save favorites to presets (the first empty slot; existing presets are never overwritten)
