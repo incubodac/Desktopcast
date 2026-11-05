@@ -4,30 +4,136 @@ A PyQt6 application for controlling Yamaha receivers with MusicCast/YXC API
 """
 
 import sys
+import json
 import time
+import socket
 import threading
+from collections import Counter
+
 import requests
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QPushButton, QSlider, QListWidget, QListWidgetItem,
-    QComboBox, QMessageBox, QGroupBox
+    QComboBox, QMessageBox, QGroupBox, QMenu, QStyle, QStyleOptionSlider
 )
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QSize, QUrl
-from PyQt6.QtGui import QPixmap, QIcon
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QSize, QUrl, QSettings
+from PyQt6.QtGui import QPixmap, QIcon, QPainter, QColor, QKeySequence, QShortcut
 from PyQt6.QtNetwork import QNetworkAccessManager, QNetworkRequest, QNetworkReply
 
-# Default receiver IP address
+# Receiver IP offered when no receiver has been remembered yet
 DEFAULT_IP = "192.168.0.248"
 
 # Enable/disable debug output
 DEBUG = False
+
+# Where remembered receivers are stored (QSettings)
+SETTINGS_ORG = "Desktopcast"
+SETTINGS_APP = "Desktopcast"
+
+# Sent with every request so the receiver pushes change events to us over UDP
+EVENT_APP_NAME = "MusicCast/1.0(Desktopcast)"
+
+# Polling: fast until the receiver's push events are confirmed working, then a slow safety net
+POLL_MS_WITHOUT_EVENTS = 1500
+POLL_MS_WITH_EVENTS = 5000
+
+# List item attribute bit (getListInfo): item can be added to the play queue
+ATTR_ADD_PLAY_QUEUE = 1 << 25
+
+# Volume: one click of -/+ in slider steps, and the largest jump up sent at once
+# (a click near the end of the slider ramps up instead of blasting)
+VOLUME_BUTTON_STEPS = 2
+VOLUME_MAX_STEP_UP = 12
+
+# Known receiver models. The R-N602 doesn't report volume in dB, so it's computed
+# as db_min + volume * db_step (Yamaha's 0.5 dB steps, volume 0 = silent).
+# queue_editing marks models where the undocumented queue commands were tested.
+MODEL_PROFILES = {
+    "R-N602": {
+        "label": "Yamaha R-N602",
+        "db_min": -80.5,
+        "db_step": 0.5,
+        "loud_db": -20.0,
+        "scale_db": (-80, -60, -40, -20, 0),
+        "queue_editing": True,
+    },
+}
 
 
 def debug_print(*args, **kwargs):
     """Print debug messages if DEBUG is enabled"""
     if DEBUG:
         print(*args, **kwargs)
+
+
+def resolve_profile(model_name: str, features: dict) -> dict:
+    """Volume and capability profile for a receiver: a known model's profile,
+    else what getFeatures says, else Yamaha's usual 0-161 = -80.5..0 dB convention"""
+    zone = {}
+    if features:
+        zone = next((z for z in features.get("zone", []) if z.get("id") == "main"), {})
+    steps = {r.get("id"): r for r in zone.get("range_step", [])}
+    volume_range = steps.get("volume", {"min": 0, "max": 100})
+
+    profile = {
+        "model": model_name or "Unknown",
+        "label": model_name or "Unknown model",
+        "known": model_name in MODEL_PROFILES,
+        "vol_min": volume_range.get("min", 0),
+        "vol_max": volume_range.get("max", 100),
+        "db_min": None,
+        "db_step": None,
+        "db_source": None,
+        "loud_db": None,
+        "scale_db": None,
+        "queue_editing": False,
+    }
+
+    if model_name in MODEL_PROFILES:
+        profile.update(MODEL_PROFILES[model_name])
+        profile["db_source"] = "profile"
+    elif "actual_volume_db" in steps:
+        profile["db_min"] = steps["actual_volume_db"].get("min")
+        profile["db_step"] = steps["actual_volume_db"].get("step")
+        profile["db_source"] = "receiver"
+    elif profile["vol_max"] == 161:
+        profile["db_min"], profile["db_step"] = -80.5, 0.5
+        profile["db_source"] = "estimate"
+
+    if profile["db_min"] is not None and profile["scale_db"] is None:
+        top = profile["db_min"] + profile["vol_max"] * profile["db_step"]
+        profile["scale_db"] = tuple(range(-80, int(top) + 1, 20))
+    return profile
+
+
+def volume_to_db(profile: dict, volume: int):
+    """Volume in dB for a raw volume value, or None if the model has no dB scale"""
+    if not profile or profile.get("db_min") is None:
+        return None
+    return profile["db_min"] + volume * profile["db_step"]
+
+
+def db_to_volume(profile: dict, db: float) -> int:
+    """Raw volume value for a dB value (inverse of volume_to_db)"""
+    return round((db - profile["db_min"]) / profile["db_step"])
+
+
+def format_volume(profile: dict, volume: int) -> str:
+    """Volume as the receiver's display would show it (dB when known)"""
+    db = volume_to_db(profile, volume)
+    if db is None:
+        return str(volume)
+    if volume <= profile.get("vol_min", 0):
+        return "−∞ dB"
+    return f"{db:+.1f} dB".replace("-", "−")
+
+
+def format_time(seconds) -> str:
+    """Seconds as m:ss (empty for unknown values)"""
+    if not isinstance(seconds, int) or seconds < 0:
+        return ""
+    return f"{seconds // 60}:{seconds % 60:02d}"
 
 
 # =============================================================================
@@ -42,13 +148,20 @@ class YamahaAPI:
         self.ip = ip
         self.zone = "main"
         self.timeout = 5
+        # One kept-alive connection pool: about half the latency of a new connection per request
+        self.session = requests.Session()
 
-    def _get(self, endpoint: str, params: dict = None) -> dict:
+    def enable_events(self, port: int):
+        """Ask the receiver to push change events to a local UDP port.
+        Every request renews the subscription, which otherwise lapses after 10 minutes."""
+        self.session.headers.update({"X-AppName": EVENT_APP_NAME, "X-AppPort": str(port)})
+
+    def _get(self, endpoint: str, params: dict = None, timeout: float = None) -> dict:
         """Make a GET request to the API"""
         try:
             url = f"{self.base_url}{endpoint}"
             debug_print(f"[API] GET {endpoint} params={params}")
-            response = requests.get(url, params=params, timeout=self.timeout)
+            response = self.session.get(url, params=params, timeout=timeout or self.timeout)
             if response.status_code == 200:
                 data = response.json()
                 debug_print(f"[API] Response: code={data.get('response_code', 'N/A')}")
@@ -73,6 +186,10 @@ class YamahaAPI:
         """Get device information"""
         return self._get("/system/getDeviceInfo")
 
+    def get_network_status(self) -> dict:
+        """Get network information (includes the receiver's room name)"""
+        return self._get("/system/getNetworkStatus")
+
     # === ZONE ENDPOINTS ===
     
     def get_status(self) -> dict:
@@ -87,6 +204,10 @@ class YamahaAPI:
     def set_volume(self, volume: int) -> dict:
         """Set volume level"""
         return self._get(f"/{self.zone}/setVolume", {"volume": volume})
+
+    def set_mute(self, mute: bool) -> dict:
+        """Mute or unmute"""
+        return self._get(f"/{self.zone}/setMute", {"enable": "true" if mute else "false"})
 
     def set_input(self, input_id: str) -> dict:
         """Set input source"""
@@ -165,10 +286,19 @@ class YamahaAPI:
         """Get current play queue"""
         return self._get("/netusb/getPlayQueue", {"index": 0, "size": size})
 
-    def manage_play(self, operation: str, index: int = -1) -> dict:
-        """Manage playback queue"""
-        params = {"type": operation, "index": index, "zone": self.zone}
-        return self._get("/netusb/managePlay", params)
+    # Queue editing isn't in Yamaha's public spec; these calls were verified on an RX-A602.
+
+    def manage_play_queue(self, operation: str, index: int) -> dict:
+        """Act on a play queue entry ("play" jumps to it, "remove" deletes it)"""
+        params = {"type": operation, "index": index, "zone": self.zone, "timeout": 5000}
+        return self._get("/netusb/managePlayQueue", params, timeout=10)
+
+    def manage_list(self, operation: str, index: int) -> dict:
+        """Queue an item of the current menu ("add_to_queue" appends it,
+        "play_next" inserts it after the current track)"""
+        params = {"list_id": "main", "type": operation, "index": index,
+                  "zone": self.zone, "timeout": 5000}
+        return self._get("/netusb/manageList", params, timeout=10)
 
     def get_preset_info(self) -> dict:
         """Get saved presets"""
@@ -194,7 +324,7 @@ class YamahaAPI:
             "index": index
         }
         try:
-            response = requests.post(url, json=payload, timeout=10)
+            response = self.session.post(url, json=payload, timeout=10)
             return response.json()
         except Exception as e:
             debug_print(f"[API] Search error: {e}")
@@ -246,8 +376,107 @@ class Worker(QObject):
         self.kwargs = kwargs
 
     def run(self):
-        result = self.func(*self.args, **self.kwargs)
+        # Always emit, so a failing task can't leave a button stuck in its busy state
+        try:
+            result = self.func(*self.args, **self.kwargs)
+        except Exception as e:
+            debug_print(f"[Worker] {type(e).__name__}: {e}")
+            result = None
         self.finished.emit(result)
+
+
+# =============================================================================
+# RECEIVER EVENTS (UDP push notifications)
+# =============================================================================
+
+class EventListener:
+    """Receives the change events a MusicCast receiver pushes over UDP
+    (volume, power, track changes, play time...), so the app doesn't have to poll fast"""
+
+    def __init__(self, receiver_ip: str, on_event):
+        self.receiver_ip = receiver_ip
+        self.on_event = on_event
+        self.running = True
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.bind(("", 0))          # any free port; the receiver is told which one
+        self.sock.settimeout(1.0)
+        self.port = self.sock.getsockname()[1]
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
+        while self.running:
+            try:
+                data, (sender, _) = self.sock.recvfrom(65535)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            if sender != self.receiver_ip:
+                continue
+            try:
+                event = json.loads(data)
+            except ValueError:
+                continue
+            debug_print(f"[Event] {event}")
+            self.on_event(event)
+
+    def stop(self):
+        self.running = False
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
+# =============================================================================
+# VOLUME WIDGETS
+# =============================================================================
+
+class VolumeSlider(QSlider):
+    """Horizontal volume slider that can tell where a value sits on screen (for the scale)"""
+
+    def value_to_x(self, value: int) -> float:
+        opt = QStyleOptionSlider()
+        self.initStyleOption(opt)
+        style = self.style()
+        groove = style.subControlRect(QStyle.ComplexControl.CC_Slider, opt,
+                                      QStyle.SubControl.SC_SliderGroove, self)
+        handle = style.subControlRect(QStyle.ComplexControl.CC_Slider, opt,
+                                      QStyle.SubControl.SC_SliderHandle, self)
+        span = max(1, groove.width() - handle.width())
+        pos = QStyle.sliderPositionFromValue(self.minimum(), self.maximum(), value, span)
+        return groove.x() + handle.width() / 2 + pos
+
+
+class VolumeScale(QWidget):
+    """Labelled marks under the volume slider (dB for known models); the loud zone is orange"""
+
+    def __init__(self, slider: VolumeSlider):
+        super().__init__()
+        self.slider = slider
+        self.marks = []           # (value, label, is_loud)
+        self.setFixedHeight(self.fontMetrics().height() + 6)
+
+    def set_marks(self, marks):
+        self.marks = marks
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        font = painter.font()
+        font.setPointSizeF(max(7.0, font.pointSizeF() - 2))
+        painter.setFont(font)
+        metrics = painter.fontMetrics()
+        normal = self.palette().color(self.foregroundRole())
+        normal.setAlpha(150)
+        for value, label, is_loud in self.marks:
+            x = self.slider.value_to_x(value)
+            painter.setPen(QColor(220, 120, 0) if is_loud else normal)
+            painter.drawLine(int(x), 0, int(x), 3)
+            width = metrics.horizontalAdvance(label)
+            left = min(max(0, x - width / 2), self.width() - width)
+            painter.drawText(int(left), 4 + metrics.ascent(), label)
+        painter.end()
 
 
 # =============================================================================
@@ -260,14 +489,31 @@ class DesktopCastApp(QMainWindow):
     # Signals for thread-safe UI updates
     update_browse_signal = pyqtSignal(object)
     update_status_signal = pyqtSignal(object)
+    update_playlist_signal = pyqtSignal(object)
+    receiver_event_signal = pyqtSignal(object)
 
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Desktopcast")
         self.resize(600, 800)
-        
+
+        # Remembered receivers (by device ID, so a new IP from the router updates the entry)
+        self.settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
+
         # State
         self.api = None
+        self.profile = resolve_profile(None, None)
+        self.device_id = None
+        self.events = None                 # EventListener once connected
+        self.events_seen = False           # True after the first pushed event arrived
+        self.poll_in_flight = False
+        self.power_state = "unknown"
+        self.mute_state = False
+        self.receiver_volume = None        # last volume the receiver reported
+        self.volume_touched_at = 0.0       # when the user last moved the volume
+        self.volume_sending = False
+        self.volume_resend = False
+        self.volume_sent = None
         self.current_input = "tidal"
         self.current_view = "browse"
         self.current_menu_layer = 0
@@ -283,7 +529,19 @@ class DesktopCastApp(QMainWindow):
         self.playback_state = "stop"
         self.skip_list_update = False
         self.viewing_album_tracks = False  # True when showing album track list from play queue
-        
+
+        # Playlist mode: double-click queues items, the receiver's queue is shown alongside
+        self.playlist_mode = False
+        self.playlist_loading = False
+        self.playlist_signature = None
+        self.playlist_texts = None         # last queue seen, to notice when it gets wiped
+        self.playlist_removes = 0          # removals sent since then (those explain shrinking)
+        self.width_before_playlist = 600
+
+        # Last thing the app asked the receiver to do (reported if the queue gets wiped)
+        self.last_action = ""
+        self.last_action_time = 0.0
+
         # Thumbnail handling
         self.thumbnail_cache = {}
         self.network_manager = QNetworkAccessManager()
@@ -295,7 +553,9 @@ class DesktopCastApp(QMainWindow):
 
         # Connect signals
         self.update_browse_signal.connect(self._update_browse_widget)
-        self.update_status_signal.connect(self._apply_status_update)
+        self.update_status_signal.connect(self._on_poll_result)
+        self.update_playlist_signal.connect(self._update_playlist_widget)
+        self.receiver_event_signal.connect(self._on_receiver_event)
 
         # Build UI
         self._setup_ui()
@@ -304,8 +564,41 @@ class DesktopCastApp(QMainWindow):
         self.poll_timer = QTimer()
         self.poll_timer.timeout.connect(self._poll_status)
 
+        # Playlist refresh timer (runs only in playlist mode)
+        self.playlist_timer = QTimer()
+        self.playlist_timer.timeout.connect(self._refresh_playlist)
+
+        # Volume is sent at most every 150 ms while the slider moves
+        self.volume_send_timer = QTimer()
+        self.volume_send_timer.setSingleShot(True)
+        self.volume_send_timer.timeout.connect(self._send_volume)
+
         # Start with controls disabled
         self._enable_controls(False)
+
+        # Reconnect to the receiver used last time
+        if self.settings.value("last_ip", ""):
+            QTimer.singleShot(0, lambda: self._connect_device(quiet=True))
+
+    def closeEvent(self, event):
+        """Stop the event listener when the window closes"""
+        if self.events:
+            self.events.stop()
+        super().closeEvent(event)
+
+    def _run_in_background(self, func, on_done=None):
+        """Run func in a thread; on_done(result) runs on the UI thread afterwards"""
+        worker = Worker(func)
+        if on_done:
+            worker.finished.connect(on_done)
+        worker.finished.connect(lambda _result, w=worker: self.workers.remove(w))
+        self.workers.append(worker)
+        threading.Thread(target=worker.run, daemon=True).start()
+
+    def _note_action(self, text: str):
+        """Remember the last command sent, to explain a wiped queue if that happens"""
+        self.last_action = text
+        self.last_action_time = time.monotonic()
 
     def _setup_ui(self):
         """Build the user interface"""
@@ -317,13 +610,18 @@ class DesktopCastApp(QMainWindow):
         conn_box = QGroupBox("Connection")
         conn_layout = QHBoxLayout()
         
-        self.ip_input = QLineEdit(DEFAULT_IP)
-        self.ip_input.setPlaceholderText("Receiver IP (e.g., 192.168.1.50)")
+        # Editable list of remembered receivers ("IP · name (model)"); a typed IP works too
+        self.ip_input = QComboBox()
+        self.ip_input.setEditable(True)
+        self.ip_input.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.ip_input.lineEdit().setPlaceholderText("Receiver IP (e.g., 192.168.1.50)")
+        self.ip_input.lineEdit().returnPressed.connect(self._connect_device)
+        self._load_saved_receivers()
         self.connect_btn = QPushButton("Connect")
-        self.connect_btn.clicked.connect(self._connect_device)
-        
-        conn_layout.addWidget(QLabel("IP:"))
-        conn_layout.addWidget(self.ip_input)
+        self.connect_btn.clicked.connect(lambda: self._connect_device())
+
+        conn_layout.addWidget(QLabel("Receiver:"))
+        conn_layout.addWidget(self.ip_input, 1)
         conn_layout.addWidget(self.connect_btn)
         conn_box.setLayout(conn_layout)
         layout.addWidget(conn_box)
@@ -331,23 +629,57 @@ class DesktopCastApp(QMainWindow):
         # --- Basic Controls ---
         control_box = QGroupBox("Basic Control")
         control_layout = QHBoxLayout()
-        
+
         self.power_btn = QPushButton("Power: ?")
         self.power_btn.setCheckable(True)
         self.power_btn.clicked.connect(self._toggle_power)
-        
-        self.vol_slider = QSlider(Qt.Orientation.Horizontal)
+
+        self.mute_btn = QPushButton("🔈")
+        self.mute_btn.setCheckable(True)
+        self.mute_btn.setToolTip("Mute")
+        self.mute_btn.setFixedWidth(44)
+        self.mute_btn.clicked.connect(self._toggle_mute)
+
+        self.vol_down_btn = QPushButton("−")
+        self.vol_down_btn.setFixedWidth(32)
+        self.vol_down_btn.setAutoRepeat(True)
+        self.vol_down_btn.clicked.connect(lambda: self._step_volume(-VOLUME_BUTTON_STEPS))
+        self.vol_up_btn = QPushButton("+")
+        self.vol_up_btn.setFixedWidth(32)
+        self.vol_up_btn.setAutoRepeat(True)
+        self.vol_up_btn.clicked.connect(lambda: self._step_volume(VOLUME_BUTTON_STEPS))
+
+        # The slider sends while it moves (drag, click, wheel, arrow keys), throttled
+        self.vol_slider = VolumeSlider(Qt.Orientation.Horizontal)
         self.vol_slider.setRange(0, 100)
-        self.vol_slider.sliderReleased.connect(self._change_volume)
-        
+        self.vol_slider.setPageStep(10)
+        self.vol_slider.valueChanged.connect(self._on_volume_slider_changed)
+        self.vol_scale = VolumeScale(self.vol_slider)
+
+        slider_column = QVBoxLayout()
+        slider_column.setSpacing(0)
+        slider_column.addWidget(self.vol_slider)
+        slider_column.addWidget(self.vol_scale)
+
+        self.vol_label = QLabel("–")
+        self.vol_label.setMinimumWidth(110)
+        self.vol_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        font = self.vol_label.font()
+        font.setBold(True)
+        font.setPointSizeF(font.pointSizeF() + 2)
+        self.vol_label.setFont(font)
+
         control_layout.addWidget(self.power_btn)
-        control_layout.addWidget(QLabel("Vol:"))
-        control_layout.addWidget(self.vol_slider)
+        control_layout.addWidget(self.mute_btn)
+        control_layout.addWidget(self.vol_down_btn)
+        control_layout.addLayout(slider_column, 1)
+        control_layout.addWidget(self.vol_up_btn)
+        control_layout.addWidget(self.vol_label)
         control_box.setLayout(control_layout)
         layout.addWidget(control_box)
 
         # --- Input & Navigation ---
-        nav_box = QGroupBox("Input & Navigation")
+        nav_box = QGroupBox("Input && Navigation")
         nav_layout = QVBoxLayout()
 
         # Input selector
@@ -369,17 +701,20 @@ class DesktopCastApp(QMainWindow):
         nav_btn_layout = QHBoxLayout()
         self.recent_btn = QPushButton("🕐 Recent")
         self.recent_btn.clicked.connect(self._show_recent)
-        self.queue_btn = QPushButton("📋 Queue")
-        self.queue_btn.clicked.connect(self._show_queue)
         self.presets_btn = QPushButton("⭐ Presets")
         self.presets_btn.clicked.connect(self._show_presets)
         self.save_preset_btn = QPushButton("💾 Save")
         self.save_preset_btn.clicked.connect(self._save_preset)
-        
+        # The playlist panel is the queue view: it shows the receiver's queue and edits it
+        self.playlist_btn = QPushButton("🎶 Playlist Mode")
+        self.playlist_btn.setCheckable(True)
+        self.playlist_btn.setToolTip("Show the queue beside the browser; double-click adds instead of playing")
+        self.playlist_btn.toggled.connect(self._toggle_playlist_mode)
+
         nav_btn_layout.addWidget(self.recent_btn)
-        nav_btn_layout.addWidget(self.queue_btn)
         nav_btn_layout.addWidget(self.presets_btn)
         nav_btn_layout.addWidget(self.save_preset_btn)
+        nav_btn_layout.addWidget(self.playlist_btn)
 
         # Navigation buttons - Row 2
         browse_btn_layout = QHBoxLayout()
@@ -390,7 +725,7 @@ class DesktopCastApp(QMainWindow):
         self.back_btn.setEnabled(False)
         self.refresh_btn = QPushButton("🔄 Refresh")
         self.refresh_btn.clicked.connect(self._refresh_browse)
-        
+
         browse_btn_layout.addWidget(self.home_btn)
         browse_btn_layout.addWidget(self.back_btn)
         browse_btn_layout.addWidget(self.refresh_btn)
@@ -406,22 +741,79 @@ class DesktopCastApp(QMainWindow):
         search_layout.addWidget(self.search_input)
         search_layout.addWidget(self.search_btn)
 
-        # Status label
+        # Status label, and a hint saying what double-click does right now
         self.status_label = QLabel("Not connected")
+        self.mode_hint = QLabel()
+        self.mode_hint.setStyleSheet("color: gray;")
+        self._update_mode_hint()
 
         # List widget
         self.list_widget = QListWidget()
         self.list_widget.setIconSize(QSize(64, 64))
         self.list_widget.itemDoubleClicked.connect(self._on_item_double_click)
+        self.list_widget.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.list_widget.customContextMenuRequested.connect(self._show_browse_menu)
 
         nav_layout.addLayout(input_layout)
         nav_layout.addLayout(nav_btn_layout)
         nav_layout.addLayout(browse_btn_layout)
         nav_layout.addLayout(search_layout)
         nav_layout.addWidget(self.status_label)
+        nav_layout.addWidget(self.mode_hint)
         nav_layout.addWidget(self.list_widget)
         nav_box.setLayout(nav_layout)
-        layout.addWidget(nav_box)
+
+        # --- Playlist (visible in playlist mode) ---
+        self.playlist_box = QGroupBox("🎶 Playlist (receiver queue)")
+        playlist_layout = QVBoxLayout()
+
+        self.playlist_info = QLabel(
+            "Double-click a song or album in the browser to add it. Right-click for more."
+        )
+        self.playlist_info.setWordWrap(True)
+
+        # Shown when the receiver wipes the queue, with the command that came just before
+        self.playlist_warning = QLabel()
+        self.playlist_warning.setWordWrap(True)
+        self.playlist_warning.setStyleSheet("color: rgb(200, 100, 0);")
+        self.playlist_warning.hide()
+
+        self.playlist_widget = QListWidget()
+        self.playlist_widget.itemDoubleClicked.connect(self._play_playlist_item)
+        for key in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+            shortcut = QShortcut(QKeySequence(key), self.playlist_widget)
+            shortcut.setContext(Qt.ShortcutContext.WidgetShortcut)
+            shortcut.activated.connect(self._remove_playlist_item)
+
+        playlist_btn_layout = QHBoxLayout()
+        self.playlist_play_btn = QPushButton("▶ Play")
+        self.playlist_play_btn.clicked.connect(
+            lambda: self._play_playlist_item(self.playlist_widget.currentItem())
+        )
+        self.playlist_skip_btn = QPushButton("⏭ Skip")
+        self.playlist_skip_btn.clicked.connect(self._skip_playlist_track)
+        self.playlist_remove_btn = QPushButton("🗑 Remove")
+        self.playlist_remove_btn.clicked.connect(self._remove_playlist_item)
+        self.playlist_refresh_btn = QPushButton("🔄")
+        self.playlist_refresh_btn.clicked.connect(self._refresh_playlist)
+
+        playlist_btn_layout.addWidget(self.playlist_play_btn)
+        playlist_btn_layout.addWidget(self.playlist_skip_btn)
+        playlist_btn_layout.addWidget(self.playlist_remove_btn)
+        playlist_btn_layout.addWidget(self.playlist_refresh_btn)
+
+        playlist_layout.addWidget(self.playlist_info)
+        playlist_layout.addWidget(self.playlist_warning)
+        playlist_layout.addWidget(self.playlist_widget)
+        playlist_layout.addLayout(playlist_btn_layout)
+        self.playlist_box.setLayout(playlist_layout)
+        self.playlist_box.hide()
+
+        # Browser and playlist side by side
+        content_layout = QHBoxLayout()
+        content_layout.addWidget(nav_box, 3)
+        content_layout.addWidget(self.playlist_box, 2)
+        layout.addLayout(content_layout)
 
         # --- Now Playing ---
         np_box = QGroupBox("Now Playing")
@@ -430,6 +822,9 @@ class DesktopCastApp(QMainWindow):
         self.track_label = QLabel("Track: -")
         self.artist_label = QLabel("Artist: -")
         self.album_label = QLabel("Album: -")
+        self.time_label = QLabel("")
+        self.play_time = None
+        self.total_time = None
 
         trans_layout = QHBoxLayout()
         self.prev_btn = QPushButton("⏮ Prev")
@@ -447,6 +842,7 @@ class DesktopCastApp(QMainWindow):
         np_layout.addWidget(self.track_label)
         np_layout.addWidget(self.artist_label)
         np_layout.addWidget(self.album_label)
+        np_layout.addWidget(self.time_label)
         np_layout.addLayout(trans_layout)
         np_box.setLayout(np_layout)
         layout.addWidget(np_box)
@@ -454,93 +850,161 @@ class DesktopCastApp(QMainWindow):
     def _enable_controls(self, enable: bool):
         """Enable or disable all controls"""
         controls = [
-            self.power_btn, self.vol_slider, self.input_combo, self.set_input_btn,
-            self.list_widget, self.recent_btn, self.queue_btn, self.presets_btn,
-            self.save_preset_btn, self.home_btn, self.refresh_btn,
+            self.power_btn, self.mute_btn, self.vol_down_btn, self.vol_slider, self.vol_up_btn,
+            self.input_combo, self.set_input_btn,
+            self.list_widget, self.recent_btn, self.presets_btn,
+            self.save_preset_btn, self.home_btn, self.refresh_btn, self.playlist_btn,
             self.prev_btn, self.play_btn, self.next_btn, self.search_btn
         ]
         for ctrl in controls:
             ctrl.setEnabled(enable)
 
+    def _update_mode_hint(self):
+        """Tell the user what double-click does in the current mode"""
+        if self.playlist_mode:
+            self.mode_hint.setText("🎶 Double-click adds to the playlist · right-click for more")
+        else:
+            self.mode_hint.setText("Double-click plays (replaces the queue) · right-click for more")
+
     # =========================================================================
     # CONNECTION
     # =========================================================================
 
-    def _connect_device(self):
-        """Connect to the Yamaha receiver"""
-        ip = self.ip_input.text().strip()
+    def _saved_receivers(self) -> list:
+        """Remembered receivers, most recently used first"""
+        try:
+            receivers = json.loads(self.settings.value("receivers", "[]"))
+        except (TypeError, ValueError):
+            receivers = []
+        return [r for r in receivers if isinstance(r, dict) and r.get("ip")]
+
+    @staticmethod
+    def _receiver_label(receiver: dict) -> str:
+        """Text shown in the receiver list: IP first, so it can be read back"""
+        details = " · ".join(x for x in (receiver.get("name"), receiver.get("model")) if x)
+        return f"{receiver['ip']}  ·  {details}" if details else receiver["ip"]
+
+    def _load_saved_receivers(self):
+        """Fill the receiver list from settings (falls back to the default IP)"""
+        self.ip_input.clear()
+        receivers = self._saved_receivers()
+        for receiver in receivers:
+            self.ip_input.addItem(self._receiver_label(receiver), receiver["ip"])
+        if not receivers:
+            self.ip_input.setEditText(DEFAULT_IP)
+
+    def _remember_receiver(self, ip: str, device_id: str, model: str, name: str):
+        """Save this receiver as the most recent one (same device ID = same entry)"""
+        receivers = [r for r in self._saved_receivers()
+                     if r.get("ip") != ip and not (device_id and r.get("device_id") == device_id)]
+        receivers.insert(0, {"ip": ip, "device_id": device_id, "model": model, "name": name})
+        self.settings.setValue("receivers", json.dumps(receivers[:10]))
+        self.settings.setValue("last_ip", ip)
+        self.ip_input.blockSignals(True)
+        self._load_saved_receivers()
+        self.ip_input.setCurrentIndex(0)
+        self.ip_input.blockSignals(False)
+
+    def _entered_ip(self) -> str:
+        """IP from the receiver field (an entry reads "IP · name (model)")"""
+        text = self.ip_input.currentText().strip()
+        return text.split()[0] if text else ""
+
+    def _connect_device(self, quiet: bool = False):
+        """Connect to the Yamaha receiver (quiet: startup reconnect, no error dialog)"""
+        ip = self._entered_ip()
         if not ip:
             QMessageBox.warning(self, "Warning", "Please enter an IP address")
             return
 
         self.connect_btn.setEnabled(False)
         self.connect_btn.setText("Connecting...")
+        self.status_label.setText(f"Connecting to {ip}...")
 
         def do_connect():
             api = YamahaAPI(ip)
             features = api.get_features()
             if not features:
-                return (None, None, None, None, None, None)
-            
+                return None
+
+            device = api.get_device_info() or {}
+            network = api.get_network_status() or {}
             services = api.get_service_info()
             status = api.get_status()
             current_input = "tidal"
             if status and status.get('response_code') == 0:
                 current_input = status.get('input', 'tidal')
-            
+
             list_info = api.get_list_info(input_id=current_input, list_id="main", size=8)
-            return (api, features, services, status, list_info, current_input)
+            return (api, features, device, network, services, status, list_info, current_input)
 
         def on_connected(result):
-            api, features, services, status, list_info, current_input = result
-            
             self.connect_btn.setEnabled(True)
             self.connect_btn.setText("Connect")
 
-            # Check if connection was successful
-            if features and features.get('response_code') == 0:
-                self.api = api
-                self._enable_controls(True)
-                
-                # Update input combo if we got service info
-                if services and services.get('response_code') == 0:
-                    service_list = services.get('service_list', [])
-                    if service_list:
-                        self.input_combo.clear()
-                        for svc in service_list:
-                            if isinstance(svc, dict):
-                                if svc.get('enable', True):
-                                    name = svc.get('id') or svc.get('input', '')
-                                    if name:
-                                        self.input_combo.addItem(name)
-                            elif isinstance(svc, str):
-                                self.input_combo.addItem(svc)
+            if not result or not result[1] or result[1].get('response_code') != 0:
+                self.status_label.setText(f"❌ Could not reach a receiver at {ip}")
+                if not quiet:
+                    QMessageBox.critical(self, "Error",
+                        "Could not connect to Yamaha receiver.\n"
+                        "Check IP address and network.")
+                return
 
-                # Set current input
-                self.current_input = current_input
-                idx = self.input_combo.findText(current_input)
-                if idx >= 0:
-                    self.input_combo.setCurrentIndex(idx)
+            api, features, device, network, services, status, list_info, current_input = result
+            if self.events:
+                self.events.stop()
+            self.api = api
+            self._enable_controls(True)
 
-                # Update browse list
-                if list_info and list_info.get('response_code') == 0:
-                    self._update_browse_widget(list_info)
+            # Model profile (volume scale in dB, tested features)
+            model = device.get('model_name', '')
+            name = network.get('network_name', '')
+            self.device_id = device.get('device_id', '')
+            self.profile = resolve_profile(model, features)
+            self._apply_volume_profile()
+            self._remember_receiver(ip, self.device_id, model, name)
+            self.setWindowTitle(f"Desktopcast · {name or model or ip}")
 
-                # Start polling
-                self.poll_timer.start(1000)
-                
-                system_id = features.get('system', {}).get('id', 'Unknown')
-                QMessageBox.information(self, "Connected", 
-                    f"Connected to Yamaha receiver\nSystem: {system_id}")
-            else:
-                QMessageBox.critical(self, "Error", 
-                    "Could not connect to Yamaha receiver.\n"
-                    "Check IP address and network.")
+            # Ask the receiver to push changes; keep fast polling until events show up
+            self.events_seen = False
+            try:
+                self.events = EventListener(ip, self.receiver_event_signal.emit)
+                api.enable_events(self.events.port)
+            except OSError as e:
+                debug_print(f"[Event] Listener not started: {e}")
+                self.events = None
 
-        worker = Worker(do_connect)
-        worker.finished.connect(on_connected)
-        self.workers.append(worker)
-        threading.Thread(target=worker.run, daemon=True).start()
+            # Update input combo if we got service info
+            if services and services.get('response_code') == 0:
+                service_list = services.get('service_list', [])
+                if service_list:
+                    self.input_combo.clear()
+                    for svc in service_list:
+                        if isinstance(svc, dict):
+                            if svc.get('enable', True):
+                                service_id = svc.get('id') or svc.get('input', '')
+                                if service_id:
+                                    self.input_combo.addItem(service_id)
+                        elif isinstance(svc, str):
+                            self.input_combo.addItem(svc)
+
+            # Set current input
+            self.current_input = current_input
+            idx = self.input_combo.findText(current_input)
+            if idx >= 0:
+                self.input_combo.setCurrentIndex(idx)
+
+            # Show power/volume right away, then the browse list
+            self._apply_status_update({"status": status})
+            if list_info and list_info.get('response_code') == 0:
+                self._update_browse_widget(list_info)
+
+            # Start polling
+            self.poll_timer.start(POLL_MS_WITHOUT_EVENTS)
+            known = "" if self.profile["known"] else " (no profile for this model yet)"
+            self.status_label.setText(f"✅ Connected: {name or ip} · {self.profile['label']}{known}")
+
+        self._run_in_background(do_connect, on_connected)
 
     # =========================================================================
     # BASIC CONTROLS
@@ -550,22 +1014,123 @@ class DesktopCastApp(QMainWindow):
         """Toggle power state"""
         if not self.api:
             return
-        is_on = self.power_btn.text() == "Power: ON"
+        turn_on = self.power_state != "on"
         self.power_btn.setText("Power: ...")
-        threading.Thread(
-            target=lambda: self.api.set_power(not is_on), 
-            daemon=True
-        ).start()
+        self._run_in_background(lambda: self.api.set_power(turn_on),
+                                lambda _: QTimer.singleShot(500, self._poll_status))
 
-    def _change_volume(self):
-        """Change volume"""
+    # --- Volume ---
+
+    def _apply_volume_profile(self):
+        """Set the slider range and the scale marks from the receiver's profile"""
+        profile = self.profile
+        self.vol_slider.blockSignals(True)
+        self.vol_slider.setRange(profile["vol_min"], profile["vol_max"])
+        self.vol_slider.blockSignals(False)
+
+        marks = []
+        if profile.get("db_min") is not None:
+            loud = profile.get("loud_db")
+            for db in profile.get("scale_db") or ():
+                value = db_to_volume(profile, db)
+                if profile["vol_min"] <= value <= profile["vol_max"]:
+                    label = f"{db}" if db < 0 else f"{db} dB"
+                    marks.append((value, label.replace("-", "−"), loud is not None and db >= loud))
+            source = {
+                "profile": f"{profile['label']} profile",
+                "receiver": "reported by the receiver",
+                "estimate": "estimated (Yamaha's usual 0.5 dB steps)",
+            }[profile["db_source"]]
+            self.vol_label.setToolTip(
+                f"dB = {profile['db_min']} + volume × {profile['db_step']} ({source})"
+            )
+        else:
+            span = profile["vol_max"] - profile["vol_min"]
+            for fraction in (0, 0.25, 0.5, 0.75, 1):
+                value = profile["vol_min"] + round(span * fraction)
+                marks.append((value, str(value), False))
+            self.vol_label.setToolTip("This model reports no dB scale")
+        self.vol_scale.set_marks(marks)
+
+    def _update_volume_label(self, value: int):
+        """Show the volume as the receiver displays it"""
+        text = format_volume(self.profile, value)
+        if self.mute_state:
+            text = f"🔇 {text}"
+        self.vol_label.setText(text)
+        loud = self.profile.get("loud_db")
+        db = volume_to_db(self.profile, value)
+        is_loud = loud is not None and db is not None and db >= loud
+        self.vol_label.setStyleSheet("color: rgb(220, 120, 0);" if is_loud else "")
+
+    def _show_receiver_volume(self, value: int):
+        """Show a volume the receiver reported, unless the user is moving the slider"""
+        self.receiver_volume = value
+        if self.volume_sent is None:
+            self.volume_sent = value
+        user_busy = (self.vol_slider.isSliderDown()
+                     or time.monotonic() - self.volume_touched_at < 2.0
+                     or self.volume_sending or self.volume_send_timer.isActive())
+        if user_busy:
+            return
+        self.volume_sent = value
+        self.vol_slider.blockSignals(True)
+        self.vol_slider.setValue(value)
+        self.vol_slider.blockSignals(False)
+        self._update_volume_label(value)
+
+    def _on_volume_slider_changed(self, value: int):
+        """User moved the volume (drag, click, wheel, keys): update the label, send soon"""
+        self._update_volume_label(value)
+        self.volume_touched_at = time.monotonic()
+        if not self.volume_send_timer.isActive():
+            self.volume_send_timer.start(150)
+
+    def _step_volume(self, steps: int):
+        """-/+ buttons"""
+        self.vol_slider.setValue(self.vol_slider.value() + steps)
+
+    def _send_volume(self):
+        """Send the slider's volume; one request at a time, and big jumps up are ramped"""
         if not self.api:
             return
-        val = self.vol_slider.value()
-        threading.Thread(
-            target=lambda: self.api.set_volume(val), 
-            daemon=True
-        ).start()
+        if self.volume_sending:
+            self.volume_resend = True
+            return
+
+        target = self.vol_slider.value()
+        value = target
+        if self.volume_sent is not None and target > self.volume_sent + VOLUME_MAX_STEP_UP:
+            value = self.volume_sent + VOLUME_MAX_STEP_UP
+        if value == self.volume_sent:
+            return
+
+        self.volume_sending = True
+        self.volume_sent = value
+
+        def on_sent(_result):
+            self.volume_sending = False
+            self.volume_touched_at = time.monotonic()
+            if self.volume_resend or self.vol_slider.value() != self.volume_sent:
+                self.volume_resend = False
+                self.volume_send_timer.start(150)
+
+        self._run_in_background(lambda: self.api.set_volume(value), on_sent)
+
+    def _toggle_mute(self):
+        """Mute button"""
+        if not self.api:
+            return
+        mute = self.mute_btn.isChecked()
+        self._set_mute_display(mute)
+        self._run_in_background(lambda: self.api.set_mute(mute))
+
+    def _set_mute_display(self, mute: bool):
+        """Show the mute state on the button and the volume label"""
+        self.mute_state = mute
+        self.mute_btn.setChecked(mute)
+        self.mute_btn.setText("🔇" if mute else "🔈")
+        self._update_volume_label(self.vol_slider.value())
 
     def _change_input(self):
         """Change input source"""
@@ -584,6 +1149,7 @@ class DesktopCastApp(QMainWindow):
         
         self.set_input_btn.setEnabled(False)
         self.set_input_btn.setText("Switching...")
+        self._note_action(f"switched input to {input_id}")
 
         def switch_input():
             self.api.set_input(input_id)
@@ -597,10 +1163,7 @@ class DesktopCastApp(QMainWindow):
                 self.last_location_hash = ""
                 self._update_browse_widget(list_info)
 
-        worker = Worker(switch_input)
-        worker.finished.connect(on_switched)
-        self.workers.append(worker)
-        threading.Thread(target=worker.run, daemon=True).start()
+        self._run_in_background(switch_input, on_switched)
 
     def _transport(self, cmd: str):
         """Transport control"""
@@ -608,10 +1171,15 @@ class DesktopCastApp(QMainWindow):
             return
         if cmd == "play_pause":
             cmd = "pause" if self.playback_state == "play" else "play"
-        threading.Thread(
-            target=lambda: self.api.set_playback(cmd), 
-            daemon=True
-        ).start()
+            # Show the new state at once, so a quick second press does the right thing
+            self._show_playback_state("pause" if cmd == "pause" else "play")
+        self._run_in_background(lambda: self.api.set_playback(cmd),
+                                lambda _: QTimer.singleShot(300, self._poll_status))
+
+    def _show_playback_state(self, playback: str):
+        """Remember the playback state and label the play button accordingly"""
+        self.playback_state = playback
+        self.play_btn.setText("⏸ Pause" if playback == "play" else "▶ Play")
 
     # =========================================================================
     # CONTENT VIEWS (Recent, Queue, Presets)
@@ -648,51 +1216,7 @@ class DesktopCastApp(QMainWindow):
             if not items:
                 self.list_widget.addItem("📭 No recent items")
 
-        worker = Worker(fetch)
-        worker.finished.connect(update)
-        self.workers.append(worker)
-        threading.Thread(target=worker.run, daemon=True).start()
-
-    def _show_queue(self):
-        """Show play queue"""
-        if not self.api:
-            return
-        self.status_label.setText("View: 📋 Play Queue")
-        self.current_view = "queue"
-
-        def fetch():
-            return self.api.get_play_queue()
-
-        def update(data):
-            self.list_widget.clear()
-            if not data or data.get('response_code') != 0:
-                self.list_widget.addItem("❌ Could not load play queue")
-                return
-            
-            items = data.get('track_info', [])
-            playing_idx = data.get('playing_index', -1)
-            
-            for i, item in enumerate(items):
-                track = item.get('track', '???')
-                artist = item.get('artist', '')
-                prefix = "▶️ " if i == playing_idx else "   "
-                display = f"{prefix}{track}"
-                if artist:
-                    display += f" - {artist}"
-                
-                w_item = QListWidgetItem(display)
-                w_item.setData(Qt.ItemDataRole.UserRole, {
-                    "type": "queue", "index": i, "data": item
-                })
-                self.list_widget.addItem(w_item)
-            
-            if not items:
-                self.list_widget.addItem("📭 Queue is empty")
-
-        worker = Worker(fetch)
-        worker.finished.connect(update)
-        self.workers.append(worker)
-        threading.Thread(target=worker.run, daemon=True).start()
+        self._run_in_background(fetch, update)
 
     def _show_presets(self):
         """Show saved presets"""
@@ -730,28 +1254,34 @@ class DesktopCastApp(QMainWindow):
                 self.list_widget.addItem("📭 No presets saved")
                 self.list_widget.addItem("💡 Play something and click Save")
 
-        worker = Worker(fetch)
-        worker.finished.connect(update)
-        self.workers.append(worker)
-        threading.Thread(target=worker.run, daemon=True).start()
+        self._run_in_background(fetch, update)
 
     def _save_preset(self):
         """Save current playback as preset"""
         if not self.api:
             return
 
-        def do_save():
-            info = self.api.get_preset_info()
-            if info and info.get('response_code') == 0:
-                presets = info.get('preset_info', [])
-                for i, p in enumerate(presets):
-                    if not p.get('text'):
-                        return self.api.store_preset(i + 1)
-                return self.api.store_preset(40)
-            return None
+        self.status_label.setText("💾 Saving current track to presets...")
 
-        threading.Thread(target=do_save, daemon=True).start()
-        QMessageBox.information(self, "Preset", "Saving current track to presets...")
+        def do_save():
+            # First empty slot; never overwrite a saved preset
+            info = self.api.get_preset_info()
+            if not info or info.get('response_code') != 0:
+                return None
+            for i, p in enumerate(info.get('preset_info', [])):
+                if not p.get('text'):
+                    return i + 1, self.api.store_preset(i + 1)
+            return "full"
+
+        def on_saved(result):
+            if result == "full":
+                self.status_label.setText("❌ All presets are in use; nothing was overwritten")
+            elif result and result[1] and result[1].get('response_code') == 0:
+                self.status_label.setText(f"💾 Saved as preset {result[0]}")
+            else:
+                self.status_label.setText("❌ Could not save the preset")
+
+        self._run_in_background(do_save, on_saved)
 
     # =========================================================================
     # BROWSE NAVIGATION
@@ -788,10 +1318,7 @@ class DesktopCastApp(QMainWindow):
                 self.last_location_hash = ""
                 self._update_browse_widget(data)
 
-        worker = Worker(do_home)
-        worker.finished.connect(on_home)
-        self.workers.append(worker)
-        threading.Thread(target=worker.run, daemon=True).start()
+        self._run_in_background(do_home, on_home)
 
     def _browse_back(self):
         """Navigate back to parent menu"""
@@ -832,10 +1359,7 @@ class DesktopCastApp(QMainWindow):
             else:
                 self.status_label.setText("Failed to go back")
 
-        worker = Worker(do_back)
-        worker.finished.connect(on_back)
-        self.workers.append(worker)
-        threading.Thread(target=worker.run, daemon=True).start()
+        self._run_in_background(do_back, on_back)
 
     def _refresh_browse(self):
         """Force refresh - fetches current state including play queue for album tracks"""
@@ -855,37 +1379,22 @@ class DesktopCastApp(QMainWindow):
         self.polling_enabled = True
         
         def do_refresh():
-            # Fetch both browse list and play queue
-            list_info = self.api.get_list_info(
-                input_id=self.current_input, 
-                list_id="main", 
+            # The queue lives in the playlist panel; refresh only reloads the browser
+            return self.api.get_list_info(
+                input_id=self.current_input,
+                list_id="main",
                 size=8,
                 index=0
             )
-            queue_info = self.api.get_play_queue()
-            return list_info, queue_info
-        
-        def on_refreshed(result):
-            list_info, queue_info = result
-            
-            # If we have a play queue with tracks (album contents), prefer showing that
-            if queue_info and queue_info.get('response_code') == 0:
-                track_info = queue_info.get('track_info', [])
-                if track_info and len(track_info) > 0:
-                    debug_print(f"[Refresh] Showing play queue with {len(track_info)} tracks")
-                    self._update_browse_widget(queue_info)
-                    return
-            
-            # Otherwise show the browse list
+
+        def on_refreshed(list_info):
             if list_info and list_info.get('response_code') == 0:
                 self._update_browse_widget(list_info)
             else:
                 self.status_label.setText("❌ Refresh failed")
-        
-        worker = Worker(do_refresh)
-        worker.finished.connect(on_refreshed)
-        self.workers.append(worker)
-        threading.Thread(target=worker.run, daemon=True).start()
+
+        self._run_in_background(do_refresh, on_refreshed)
+        self._refresh_playlist()
 
     def _sync_receiver_state(self):
         """Alias for refresh - kept for compatibility"""
@@ -903,6 +1412,7 @@ class DesktopCastApp(QMainWindow):
         self.current_view = "browse"
         self.search_btn.setEnabled(False)
         self.search_btn.setText("...")
+        self._note_action(f"searched for '{search_text}'")
 
         def search():
             # Go to root first
@@ -948,10 +1458,7 @@ class DesktopCastApp(QMainWindow):
                 self.last_location_hash = ""
                 self._update_browse_widget(result)
 
-        worker = Worker(search)
-        worker.finished.connect(on_search)
-        self.workers.append(worker)
-        threading.Thread(target=worker.run, daemon=True).start()
+        self._run_in_background(search, on_search)
 
     # =========================================================================
     # BROWSE LIST DISPLAY
@@ -1224,27 +1731,21 @@ class DesktopCastApp(QMainWindow):
         
         if item_type == "recent":
             idx = data.get("index", 0)
+            text = data.get("data", {}).get("text", "")
+            if not self._confirm_replace_queue(text):
+                return
             debug_print(f"Playing recent item {idx}")
-            threading.Thread(
-                target=lambda: self.api.play_recent(idx), 
-                daemon=True
-            ).start()
-
-        elif item_type == "queue":
-            idx = data.get("index", 0)
-            debug_print(f"Playing queue item {idx}")
-            threading.Thread(
-                target=lambda: self.api.manage_play("play", idx), 
-                daemon=True
-            ).start()
+            self._note_action(f"played recent item '{text}'")
+            self._run_in_background(lambda: self.api.play_recent(idx))
 
         elif item_type == "preset":
             num = data.get("num", 1)
+            text = data.get("data", {}).get("text", "")
+            if not self._confirm_replace_queue(text):
+                return
             debug_print(f"Playing preset {num}")
-            threading.Thread(
-                target=lambda: self.api.recall_preset(num), 
-                daemon=True
-            ).start()
+            self._note_action(f"played preset {num} '{text}'")
+            self._run_in_background(lambda: self.api.recall_preset(num))
 
         elif item_type == "track":
             # Track from track_info (album contents / play queue)
@@ -1269,7 +1770,13 @@ class DesktopCastApp(QMainWindow):
                 debug_print(f"  -> Track from track_list, playing via queue")
                 self._play_queue_track(idx, text)
                 return
-            
+
+            # In playlist mode, songs, albums and playlists go to the queue instead of playing
+            if self.playlist_mode and self._is_queueable(data):
+                debug_print(f"  -> Playlist mode, adding to queue")
+                self._add_to_playlist(idx, text)
+                return
+
             # Attribute meanings in YXC API:
             # 0 = unplayable/unavailable
             # 1 = playable item (track)
@@ -1318,7 +1825,8 @@ class DesktopCastApp(QMainWindow):
         # Temporarily pause polling to avoid resetting view
         self.polling_enabled = False
         self.skip_list_update = True
-        
+
+        self._note_action(f"played '{text}' from the browser")
         self.status_label.setText(f"▶️ Playing: {text}")
 
         def do_play():
@@ -1337,10 +1845,7 @@ class DesktopCastApp(QMainWindow):
             # to let playback stabilize
             QTimer.singleShot(3000, self._allow_list_updates)
 
-        worker = Worker(do_play)
-        worker.finished.connect(on_played)
-        self.workers.append(worker)
-        threading.Thread(target=worker.run, daemon=True).start()
+        self._run_in_background(do_play, on_played)
 
     def _play_queue_track(self, index: int, text: str):
         """Play a specific track from the play queue / album track list"""
@@ -1355,10 +1860,10 @@ class DesktopCastApp(QMainWindow):
         debug_print(f"Playing queue track index={index} text='{text}'")
 
         def do_play():
-            # Use manage_play with type="play" and index to play specific track
+            # Jump to the track in the play queue
             # Index should be 0-based as received from the list
-            result = self.api.manage_play("play", index)
-            debug_print(f"manage_play('play', {index}) result: {result}")
+            result = self.api.manage_play_queue("play", index)
+            debug_print(f"manage_play_queue('play', {index}) result: {result}")
             time.sleep(0.5)
             return result
 
@@ -1370,10 +1875,7 @@ class DesktopCastApp(QMainWindow):
             else:
                 debug_print(f"Track playback may have failed: {result}")
 
-        worker = Worker(do_play)
-        worker.finished.connect(on_played)
-        self.workers.append(worker)
-        threading.Thread(target=worker.run, daemon=True).start()
+        self._run_in_background(do_play, on_played)
 
     def _allow_list_updates(self):
         """Re-allow list updates after playback has started"""
@@ -1398,7 +1900,8 @@ class DesktopCastApp(QMainWindow):
         
         # Store current layer to detect if we actually navigated
         original_layer = self.current_menu_layer
-        
+        self._note_action(f"opened '{text}'")
+
         # Show loading state
         self.status_label.setText(f"Opening: {text}...")
         self.list_widget.clear()
@@ -1410,7 +1913,7 @@ class DesktopCastApp(QMainWindow):
             old_track_count = len(old_queue.get('track_info', [])) if old_queue else 0
             old_first_track = ""
             if old_queue and old_queue.get('track_info'):
-                old_first_track = old_queue['track_info'][0].get('track', '')
+                old_first_track = old_queue['track_info'][0].get('text', '')
             
             # Select the item to navigate into it
             result = self.api.select_list_item(index)
@@ -1449,7 +1952,7 @@ class DesktopCastApp(QMainWindow):
                         track_count = len(track_info)
                         
                         # Check if this is a NEW queue (different from before)
-                        new_first_track = track_info[0].get('track', '') if track_info else ""
+                        new_first_track = track_info[0].get('text', '') if track_info else ""
                         queue_changed = (track_count != old_track_count or 
                                         new_first_track != old_first_track)
                         
@@ -1502,39 +2005,334 @@ class DesktopCastApp(QMainWindow):
                 self.skip_list_update = False
                 self.polling_enabled = True
 
-        worker = Worker(do_navigate)
-        worker.finished.connect(on_navigated)
-        self.workers.append(worker)
-        threading.Thread(target=worker.run, daemon=True).start()
+        self._run_in_background(do_navigate, on_navigated)
 
     # =========================================================================
-    # POLLING
+    # PLAYLIST MODE
     # =========================================================================
 
-    def _poll_status(self):
-        """Poll all status endpoints"""
-        if not self.api or not self.polling_enabled:
+    def _toggle_playlist_mode(self, enabled: bool):
+        """Show or hide the playlist panel; in playlist mode double-click queues items"""
+        self.playlist_mode = enabled
+        self.playlist_box.setVisible(enabled)
+        self._update_mode_hint()
+
+        if enabled:
+            self.width_before_playlist = self.width()
+            self.resize(max(self.width(), 1000), self.height())
+            self.playlist_signature = None
+            self.playlist_texts = None
+            self.playlist_removes = 0
+            self._set_playlist_warning("")
+            self._refresh_playlist()
+            # With push events the panel also refreshes on track changes; this is the safety net
+            self.playlist_timer.start(10000 if self.events_seen else 4000)
+        else:
+            self.playlist_timer.stop()
+            self.resize(self.width_before_playlist, self.height())
+
+    @staticmethod
+    def _is_queueable(data: dict) -> bool:
+        """True for navigator items the receiver can add to the queue (tracks, albums, playlists)"""
+        return data.get("is_playable", False) or bool(data.get("attribute", 0) & ATTR_ADD_PLAY_QUEUE)
+
+    def _confirm_replace_queue(self, text: str) -> bool:
+        """In playlist mode, ask before starting something that replaces the receiver's queue"""
+        if not self.playlist_mode or not self.playlist_texts:
+            return True
+        answer = QMessageBox.question(
+            self, "Replace the playlist?",
+            f"This starts “{text}” on the receiver, which replaces the playlist "
+            f"({len(self.playlist_texts)} tracks).\n\nTo keep the playlist, right-click a song "
+            f"in the browser and choose “Play now, keep the playlist”.\n\nStart it anyway?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if answer != QMessageBox.StandardButton.Yes:
+            return False
+        self.playlist_texts = None          # the user chose this; don't report it as a wipe
+        return True
+
+    def _show_browse_menu(self, pos):
+        """Right-click menu for navigator items"""
+        item = self.list_widget.itemAt(pos)
+        data = item.data(Qt.ItemDataRole.UserRole) if item else None
+        if not data or data.get("type") != "browse" or data.get("is_track_list"):
             return
 
-        def fetch():
-            # If skipping list updates or list is fully loaded, don't fetch list
-            if self.skip_list_update or self.list_fully_loaded:
-                return self.api.poll_all_status(
-                    input_id=self.current_input, fetch_index=-1
-                )
-            
-            fetch_idx = len(self.accumulated_items) if self.accumulated_items else 0
-            return self.api.poll_all_status(
-                input_id=self.current_input, fetch_index=fetch_idx
-            )
+        idx = data.get("index", 0)
+        text = data.get("text", "")
+        menu = QMenu(self)
+
+        if self._is_queueable(data):
+            menu.addAction("➕ Add to playlist").triggered.connect(
+                lambda: self._add_to_playlist(idx, text))
+            menu.addAction("⏭ Play next").triggered.connect(
+                lambda: self._add_to_playlist(idx, text, play_next=True))
+            menu.addAction("▶ Play now, keep the playlist").triggered.connect(
+                lambda: self._play_now_keep_queue(idx, text))
+        if data.get("is_playable"):
+            menu.addAction("▶ Play (replaces the queue)").triggered.connect(
+                lambda: self._confirm_replace_queue(text) and self._play_track(idx, text))
+        if data.get("is_container"):
+            menu.addSeparator()
+            menu.addAction("📂 Open").triggered.connect(
+                lambda: self._navigate_into_item(idx, text))
+
+        if menu.actions():
+            menu.exec(self.list_widget.viewport().mapToGlobal(pos))
+
+    def _add_to_playlist(self, index: int, text: str, play_next: bool = False):
+        """Add a navigator item to the receiver's play queue"""
+        if not self.api:
+            return
+
+        self.status_label.setText(f"➕ Adding: {text}...")
+        self._note_action(f"queued '{text}' to play next" if play_next else f"added '{text}'")
+        self._set_playlist_warning("")
+
+        def on_added(result):
+            if result and result.get('response_code') == 0:
+                self.status_label.setText(f"{'⏭ Plays next' if play_next else '✅ Added'}: {text}")
+                QTimer.singleShot(1500, self._refresh_playlist)
+            else:
+                self.status_label.setText(f"❌ Could not add: {text}")
+
+        operation = "play_next" if play_next else "add_to_queue"
+        self._run_in_background(lambda: self.api.manage_list(operation, index), on_added)
+
+    def _play_now_keep_queue(self, index: int, text: str):
+        """Play an item right away without losing the playlist:
+        insert it after the current track, then jump to it"""
+        if not self.api:
+            return
+
+        self.status_label.setText(f"▶️ Starting: {text}...")
+        self._note_action(f"started '{text}' (keeping the playlist)")
+        self._set_playlist_warning("")
+
+        def do_play():
+            queue = self.api.get_play_queue(size=200) or {}
+            playing = queue.get("playing_index", -1)
+            count = len(queue.get("track_info", []))
+            if not isinstance(playing, int) or playing < 0:
+                result, target = self.api.manage_list("add_to_queue", index), count
+            else:
+                result, target = self.api.manage_list("play_next", index), playing + 1
+            if not result or result.get("response_code") != 0:
+                return result
+            time.sleep(0.5)
+            return self.api.manage_play_queue("play", target)
+
+        def on_done(result):
+            if result and result.get("response_code") == 0:
+                self.status_label.setText(f"▶️ Playing: {text}")
+            else:
+                self.status_label.setText(f"❌ Could not start: {text}")
+            QTimer.singleShot(800, self._poll_status)
+            QTimer.singleShot(1500, self._refresh_playlist)
+
+        self._run_in_background(do_play, on_done)
+
+    def _refresh_playlist(self):
+        """Fetch the play queue for the playlist panel"""
+        if not self.api or not self.playlist_mode or self.playlist_loading:
+            return
+        self.playlist_loading = True
+        api = self.api
 
         threading.Thread(
-            target=lambda: self.update_status_signal.emit(fetch()), 
+            target=lambda: self.update_playlist_signal.emit(api.get_play_queue(size=200)),
             daemon=True
         ).start()
 
+    def _set_playlist_warning(self, text: str):
+        """Show (or clear) the wiped-queue warning above the playlist"""
+        self.playlist_warning.setText(text)
+        self.playlist_warning.setVisible(bool(text))
+
+    def _check_queue_wiped(self, texts: list) -> str:
+        """Compare with the last queue seen. If tracks vanished that this app didn't remove,
+        the receiver replaced or cleared the queue: say so, and what was done just before."""
+        previous, self.playlist_texts = self.playlist_texts, list(texts)
+        if not previous:
+            return ""
+
+        vanished = sum((Counter(previous) - Counter(texts)).values())
+        explained = min(vanished, self.playlist_removes)
+        self.playlist_removes -= explained
+        vanished -= explained
+        if vanished == 0 or (vanished == 1 and texts):
+            return ""
+
+        ago = int(time.monotonic() - self.last_action_time)
+        if self.last_action and ago < 120:
+            cause = f"Last command from this app: {self.last_action} ({ago} s before)."
+        else:
+            cause = "No command from this app just before: another app or the receiver did it."
+        what = "replaced the playlist" if texts else "cleared the playlist"
+        debug_print(f"[Playlist] Receiver {what}: {vanished} tracks gone. {cause}")
+        return f"⚠️ The receiver {what} ({vanished} tracks gone). {cause}"
+
+    def _update_playlist_widget(self, data: dict):
+        """Show the play queue in the playlist panel, keeping selection and scroll"""
+        self.playlist_loading = False
+        if not data or data.get('response_code') != 0:
+            self.playlist_info.setText("❌ Could not load the queue (receiver busy?), retrying...")
+            return
+
+        texts = [t.get('track', t.get('text', '???')) for t in data.get('track_info', [])]
+        playing_idx = data.get('playing_index', -1)
+
+        warning = self._check_queue_wiped(texts)
+        if warning:
+            self._set_playlist_warning(warning)
+
+        info = f"{len(texts)} tracks · double-click a song or album in the browser to add it"
+        if not self.profile.get("queue_editing"):
+            info += " · queue editing is untested on this model"
+        self.playlist_info.setText(info)
+
+        # Rebuild only when something changed, so the selection isn't lost every refresh
+        signature = (tuple(texts), playing_idx)
+        if signature == self.playlist_signature:
+            return
+        self.playlist_signature = signature
+
+        selected_row = self.playlist_widget.currentRow()
+        scroll_pos = self.playlist_widget.verticalScrollBar().value()
+        self.playlist_widget.clear()
+
+        for i, text in enumerate(texts):
+            prefix = "▶️" if i == playing_idx else f"{i + 1}."
+            w_item = QListWidgetItem(f"{prefix} {text}")
+            w_item.setData(Qt.ItemDataRole.UserRole, {"index": i, "text": text})
+            if i == playing_idx:
+                font = w_item.font()
+                font.setBold(True)
+                w_item.setFont(font)
+            self.playlist_widget.addItem(w_item)
+
+        if not texts:
+            self.playlist_widget.addItem("📭 Empty: add songs from the browser")
+        elif selected_row >= 0:
+            self.playlist_widget.setCurrentRow(min(selected_row, len(texts) - 1))
+        self.playlist_widget.verticalScrollBar().setValue(scroll_pos)
+
+    def _play_playlist_item(self, item):
+        """Jump playback to a playlist entry"""
+        data = item.data(Qt.ItemDataRole.UserRole) if item else None
+        if not data:
+            return
+        self._note_action(f"jumped to '{data['text']}'")
+        self._run_queue_command("play", data["index"], f"▶️ Playing: {data['text']}")
+
+    def _remove_playlist_item(self):
+        """Remove the selected entry from the playlist"""
+        item = self.playlist_widget.currentItem()
+        data = item.data(Qt.ItemDataRole.UserRole) if item else None
+        if not data:
+            return
+        self._note_action(f"removed '{data['text']}'")
+        self.playlist_removes += 1
+        self._run_queue_command("remove", data["index"], f"🗑 Removed: {data['text']}")
+
+    def _skip_playlist_track(self):
+        """Skip to the next track of the playlist"""
+        self._transport("next")
+        QTimer.singleShot(1500, self._refresh_playlist)
+
+    def _run_queue_command(self, operation: str, index: int, message: str):
+        """Run a play queue command in the background, then refresh the playlist"""
+        if not self.api:
+            return
+
+        def on_done(result):
+            if result and result.get('response_code') == 0:
+                self.status_label.setText(message)
+            else:
+                self.status_label.setText(f"❌ Queue command failed: {operation}")
+                if operation == "remove":
+                    self.playlist_removes = max(0, self.playlist_removes - 1)
+            QTimer.singleShot(1500, self._refresh_playlist)
+
+        self._run_in_background(lambda: self.api.manage_play_queue(operation, index), on_done)
+
+    # =========================================================================
+    # POLLING AND RECEIVER EVENTS
+    # =========================================================================
+
+    def _poll_status(self, list_only: bool = False):
+        """Poll the receiver. Only one poll runs at a time, so a slow receiver isn't flooded
+        with requests that then delay the user's own commands."""
+        if not self.api or not self.polling_enabled or self.poll_in_flight:
+            return
+        self.poll_in_flight = True
+
+        api = self.api
+        input_id = self.current_input
+        if self.skip_list_update or self.list_fully_loaded:
+            fetch_idx = -1
+        else:
+            fetch_idx = len(self.accumulated_items)
+
+        def fetch():
+            try:
+                if list_only and fetch_idx >= 0:
+                    result = {"list_info": api.get_list_info(input_id=input_id, index=fetch_idx),
+                              "fetch_index": fetch_idx}
+                else:
+                    result = api.poll_all_status(input_id=input_id, fetch_index=fetch_idx)
+            except Exception as e:
+                debug_print(f"Poll error: {e}")
+                result = {}
+            self.update_status_signal.emit(result)
+
+        threading.Thread(target=fetch, daemon=True).start()
+
+    def _on_poll_result(self, data: dict):
+        """A poll finished: allow the next one, then apply what it brought"""
+        self.poll_in_flight = False
+        self._apply_status_update(data)
+
+    def _on_receiver_event(self, event: dict):
+        """Apply a change the receiver pushed over UDP (runs on the UI thread)"""
+        if not self.api:
+            return
+        if not self.events_seen:
+            # Events work: polling becomes a slow safety net
+            self.events_seen = True
+            self.poll_timer.setInterval(POLL_MS_WITH_EVENTS)
+            if self.playlist_timer.isActive():
+                self.playlist_timer.setInterval(10000)
+            debug_print("[Event] Push events work, polling slowed down")
+
+        main = event.get("main") or {}
+        status = {key: main[key] for key in ("power", "volume", "mute", "input") if key in main}
+        if status:
+            status["response_code"] = 0
+            self._apply_status_update({"status": status})
+
+        netusb = event.get("netusb") or {}
+        if "play_time" in netusb:
+            self.play_time = netusb["play_time"]
+            self._update_time_label()
+        if main.get("status_updated") or netusb.get("play_info_updated"):
+            self._poll_status()
+        if netusb.get("play_info_updated") or netusb.get("play_queue"):
+            QTimer.singleShot(500, self._refresh_playlist)
+
+    def _update_time_label(self):
+        """Elapsed / total time of the current track"""
+        elapsed, total = format_time(self.play_time), format_time(self.total_time)
+        if elapsed and total and self.total_time > 0:
+            self.time_label.setText(f"⏱ {elapsed} / {total}")
+        elif elapsed and self.playback_state != "stop":
+            self.time_label.setText(f"⏱ {elapsed}")
+        else:
+            self.time_label.setText("")
+
     def _apply_status_update(self, data: dict):
-        """Apply polled status updates to UI"""
+        """Apply polled (or pushed) status updates to UI; any field may be missing"""
         try:
             if not data:
                 return
@@ -1543,15 +2341,18 @@ class DesktopCastApp(QMainWindow):
             play_info = data.get("play_info")
             list_info = data.get("list_info")
 
-            # Update power/volume
+            # Update power/volume/mute
             if status and status.get('response_code') == 0:
-                power = status.get('power', 'unknown')
-                self.power_btn.setText(f"Power: {power.upper()}")
-                self.power_btn.setChecked(power == "on")
+                if 'power' in status:
+                    self.power_state = status['power']
+                    self.power_btn.setText(f"Power: {self.power_state.upper()}")
+                    self.power_btn.setChecked(self.power_state == "on")
 
-                vol = status.get('volume')
-                if isinstance(vol, int) and not self.vol_slider.isSliderDown():
-                    self.vol_slider.setValue(vol)
+                if isinstance(status.get('volume'), int):
+                    self._show_receiver_volume(status['volume'])
+
+                if isinstance(status.get('mute'), bool) and status['mute'] != self.mute_state:
+                    self._set_mute_display(status['mute'])
 
                 # Track input changes
                 current = status.get('input', '')
@@ -1565,16 +2366,19 @@ class DesktopCastApp(QMainWindow):
 
             # Update now playing
             if play_info and play_info.get('response_code') == 0:
-                track = play_info.get('track', '-')
-                artist = play_info.get('artist', '-')
-                album = play_info.get('album', '-')
+                track = play_info.get('track') or '-'
+                artist = play_info.get('artist') or '-'
+                album = play_info.get('album') or '-'
                 playback = play_info.get('playback', 'stop')
-                self.playback_state = playback
+                self._show_playback_state(playback)
 
                 prefix = "▶️" if playback == "play" else "⏸️" if playback == "pause" else ""
                 self.track_label.setText(f"{prefix} Track: {track}")
                 self.artist_label.setText(f"Artist: {artist}")
                 self.album_label.setText(f"Album: {album}")
+                self.play_time = play_info.get('play_time')
+                self.total_time = play_info.get('total_time')
+                self._update_time_label()
 
             # Update browse list
             if list_info and list_info.get('response_code') == 0:
@@ -1604,6 +2408,10 @@ class DesktopCastApp(QMainWindow):
                     if self.list_fully_loaded:
                         return
                     self.list_fully_loaded = True
+                elif new_items:
+                    # More pages to come (the receiver sends 8 items at a time): fetch the
+                    # next one right away instead of waiting for the next poll
+                    QTimer.singleShot(50, lambda: self._poll_status(list_only=True))
 
                 display_hash = f"{menu_hash}_{len(self.accumulated_items)}"
 

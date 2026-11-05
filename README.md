@@ -29,14 +29,16 @@ Desktopcast is my answer to this problem: a lightweight, open-source desktop con
 
 ## ✨ Features
 
-- 🎛️ **Full Receiver Control** - Power, volume, and input selection
+- 🎛️ **Full Receiver Control** - Power, mute, and input selection
+- 🔊 **Volume in dB** - Live slider with a dB scale (as on the receiver's display), −/+ buttons, and a ramp that stops a stray click from jumping to full volume
 - 🎵 **Music Browsing** - Navigate Tidal, Spotify, Deezer, Qobuz, and more
 - 🔍 **Search** - Search your streaming services directly
-- 📋 **Queue Management** - View and manage your play queue
+- 🎶 **Playlist Mode** - The queue beside the browser: double-click songs, albums or playlists to add them; play, skip or remove entries; "Play now" without losing the playlist
 - 🕐 **Recent Items** - Quick access to recently played content
 - ⭐ **Presets** - Save and recall your favorite stations/playlists
 - 🖼️ **Album Art** - Beautiful thumbnail display for your music
-- 🔄 **Live Updates** - Real-time status polling
+- 📡 **Remembered Receivers** - Reconnects to the last receiver at startup; each receiver is listed by room name and model
+- 🔄 **Live Updates** - The receiver pushes changes (volume, track, play time) to the app, with polling as a fallback
 
 ## 📸 Screenshots
 
@@ -46,7 +48,7 @@ Desktopcast is my answer to this problem: a lightweight, open-source desktop con
 
 > **Note:** This project is in active development.
 
-- ✅ **Tested on:** Yamaha RX-A602 (R602N)
+- ✅ **Tested on:** Yamaha R-N602 (has a model profile: dB volume scale and tested queue editing)
 - ⚠️ **Streaming services:** Tidal is fully functional; other services (Spotify, Deezer, Qobuz, etc.) may have limited functionality
 - 🔄 **Coming soon:** Support for additional Yamaha models and potentially other receiver brands
 
@@ -96,24 +98,33 @@ Pre-built binaries for Windows, macOS, and Linux will be available in the [Relea
 1. **Connect to your receiver**
    - Enter your Yamaha receiver's IP address
    - Click "Connect"
+   - Next time the app reconnects by itself; other receivers you used are in the dropdown
 
 2. **Control playback**
    - Use the transport controls (play, pause, previous, next)
-   - Adjust volume with the slider
+   - Adjust volume with the slider (drag, click, mouse wheel or arrow keys), the −/+ buttons, or mute
 
 3. **Browse your music**
    - Select an input source (Tidal, Spotify, etc.)
    - Navigate through menus by clicking items
    - Use the search function to find specific content
+   - Right-click an item for more: add to playlist, play next, play now, open
 
 4. **Manage your queue**
-   - Click "Queue" to see currently queued tracks
+   - Click "Playlist Mode" to show the queue beside the browser
+   - Double-click a song or album to add it; double-click a queue entry to play it
+   - Select an entry and press Delete (or "Remove") to take it out
+   - If the receiver wipes the queue, the panel says so and shows the last command sent before it
    - Use "Recent" for recently played items
-   - Save favorites to presets
+   - Save favorites to presets (the first empty slot; existing presets are never overwritten)
 
 ## 🔧 Configuration
 
-The default receiver IP is `192.168.0.248`. You can change this in the application's connection field.
+The first time, the receiver field suggests `192.168.0.248`. After a successful connection the receiver is remembered (by its device ID, so a new IP from your router updates the same entry).
+
+The app asks the receiver to push changes to it over UDP. If your firewall asks whether Python may accept incoming connections, allowing it makes updates instant; if you deny it, the app falls back to polling.
+
+**Model profiles:** `MODEL_PROFILES` in `main.py` holds per-model settings (dB scale, loud zone, tested features). The R-N602 doesn't report volume in dB, so the app shows `−80.5 + 0.5 × volume` (volume 92 = −34.5 dB). Other models use the dB range the receiver reports, or the same Yamaha convention when the volume goes 0–161.
 
 To enable debug output, set `DEBUG = True` in `main.py`.
 
