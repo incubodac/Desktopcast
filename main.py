@@ -16,10 +16,11 @@ import requests
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QPushButton, QSlider, QListWidget, QListWidgetItem,
-    QComboBox, QMessageBox, QGroupBox, QMenu, QStyle, QStyleOptionSlider, QAbstractItemView
+    QComboBox, QMessageBox, QGroupBox, QMenu, QStyle, QStyleOptionSlider, QAbstractItemView,
+    QToolButton
 )
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QSize, QUrl, QSettings
-from PyQt6.QtGui import QPixmap, QIcon, QPainter, QColor, QKeySequence, QShortcut
+from PyQt6.QtGui import QPixmap, QIcon, QPainter, QColor, QKeySequence, QShortcut, QActionGroup
 from PyQt6.QtNetwork import QNetworkAccessManager, QNetworkRequest, QNetworkReply
 
 # Receiver IP offered when no receiver has been remembered yet
@@ -47,8 +48,18 @@ ATTR_PLAY_NEXT = 1 << 24
 ATTR_ADD_PLAY_QUEUE = 1 << 25
 
 # The receiver's queue holds at most 200 tracks. Adding to a full queue is answered "OK"
-# but does nothing, so the app checks the count itself.
+# but does nothing, so the app checks the count itself. (A receiver can report its own
+# limit in getFeatures; this is the default.)
 QUEUE_LIMIT = 200
+
+# Inputs offered when the receiver doesn't list its own in getFeatures
+DEFAULT_INPUTS = ("tidal", "spotify", "deezer", "qobuz", "amazon_music",
+                  "napster", "server", "net_radio", "usb", "bluetooth")
+
+# Per-receiver choice for the play queue features (Playlist Mode, double-click through the
+# queue), set in the ⚙ menu and remembered with the receiver. "auto" uses what was detected:
+# older models (e.g. receivers that got MusicCast by a firmware update) may have no queue.
+QUEUE_SETTINGS = {"auto": "Auto (use what was detected)", "on": "Always on", "off": "Off"}
 
 # Attribute value of an artist entry in Tidal lists
 ARTIST_ATTRIBUTE = 66
@@ -188,6 +199,24 @@ class YamahaAPI:
             debug_print(f"[API] Error: {endpoint} - {type(e).__name__}: {e}")
         return None
 
+    def probe(self, endpoint: str, params: dict = None):
+        """Whether the receiver knows this command: False if it doesn't (response code 3,
+        "invalid request", or HTTP 404/501), None if it didn't answer, else True (an answer
+        like "busy" or "guarded" in standby still means the command exists)"""
+        try:
+            response = self.session.get(f"{self.base_url}{endpoint}", params=params,
+                                        timeout=self.timeout)
+            if response.status_code in (404, 501):
+                return False
+            data = response.json()
+        except (requests.exceptions.RequestException, ValueError) as e:
+            debug_print(f"[API] Probe {endpoint}: {type(e).__name__}: {e}")
+            return None
+        if not isinstance(data, dict):
+            return None
+        debug_print(f"[API] Probe {endpoint}: code={data.get('response_code')}")
+        return data.get("response_code") != 3
+
     # === SYSTEM ENDPOINTS ===
     
     def get_features(self) -> dict:
@@ -294,10 +323,10 @@ class YamahaAPI:
         params = {"index": index, "zone": self.zone}
         return self._get("/netusb/recallRecentItem", params)
 
-    def get_play_queue(self, size: int = 80) -> dict:
+    def get_play_queue(self, size: int = 80, index: int = 0) -> dict:
         """Get current play queue. "type" is "user" (a queue built with add/play next/play now)
         or "system" (playing straight from a browse list, or standby): then no entries are listed."""
-        return self._get("/netusb/getPlayQueue", {"index": 0, "size": size})
+        return self._get("/netusb/getPlayQueue", {"index": index, "size": size})
 
     # Queue editing isn't in Yamaha's public spec; these calls were verified on an R-N602.
 
@@ -388,6 +417,31 @@ def play_now(api: YamahaAPI, index: int) -> dict:
             return result
     api.set_playback("play")
     return result
+
+
+# =============================================================================
+# RECEIVER CAPABILITIES (what differs between models)
+# =============================================================================
+
+def receiver_inputs(features: dict) -> list:
+    """The receiver's own inputs as (id, browsable), from getFeatures: an AV receiver lists
+    its HDMI inputs and tuner, each model its own streaming services. Only "netusb" inputs
+    (streaming services, Net Radio, Server, USB...) have menus to browse. [] if not reported."""
+    system = (features or {}).get("system") or {}
+    return [(i["id"], i.get("play_info_type", "netusb") == "netusb")
+            for i in system.get("input_list") or [] if isinstance(i, dict) and i.get("id")]
+
+
+def detect_capabilities(api: YamahaAPI, features: dict) -> dict:
+    """What this receiver supports among the features that differ between models.
+    queue: whether it has the play queue commands (True/False, None if it didn't answer);
+    queue_size: how many tracks its queue holds."""
+    netusb = (features or {}).get("netusb") or {}
+    size = (netusb.get("play_queue") or {}).get("size")
+    return {
+        "queue": api.probe("/netusb/getPlayQueue", {"index": 0, "size": 8}),
+        "queue_size": size if isinstance(size, int) and size > 0 else QUEUE_LIMIT,
+    }
 
 
 # =============================================================================
@@ -725,6 +779,14 @@ class DesktopCastApp(QMainWindow):
         self.api = None
         self.profile = resolve_profile(None, None)
         self.device_id = None
+        self.receiver = None               # ip, device_id, model, name of the connected receiver
+
+        # Differences between models: detected at connection; the queue can be overridden per
+        # receiver in the ⚙ menu (remembered with the receiver)
+        self.caps = {"queue": None, "queue_size": QUEUE_LIMIT}
+        self.queue_setting = "auto"
+        self.input_browsable = {}          # input id -> has menus to browse
+        self.queue_count = 0               # tracks in the receiver's queue, last time it was read
         self.events = None                 # EventListener once connected
         self.events_seen = False           # True after the first pushed event arrived
         self.poll_in_flight = False
@@ -838,6 +900,23 @@ class DesktopCastApp(QMainWindow):
         self.last_action = text
         self.last_action_time = time.monotonic()
 
+    @property
+    def queue_enabled(self) -> bool:
+        """Whether to use the receiver's play queue: the ⚙ choice, else what was detected
+        (unknown counts as yes, so a receiver that didn't answer the probe isn't cut off)"""
+        if self.queue_setting in ("on", "off"):
+            return self.queue_setting == "on"
+        return self.caps.get("queue") is not False
+
+    @property
+    def queue_limit(self) -> int:
+        return self.caps.get("queue_size") or QUEUE_LIMIT
+
+    def _is_browsable(self, input_id: str) -> bool:
+        """Whether an input has menus (streaming, Net Radio, Server, USB) rather than being
+        a plain source like HDMI or the tuner. Unknown inputs are tried."""
+        return self.input_browsable.get(input_id, True)
+
     def _setup_ui(self):
         """Build the user interface"""
         central = QWidget()
@@ -858,9 +937,19 @@ class DesktopCastApp(QMainWindow):
         self.connect_btn = QPushButton("Connect")
         self.connect_btn.clicked.connect(lambda: self._connect_device())
 
+        # Options for the connected receiver (remembered with it), filled when opened
+        self.receiver_menu = QMenu(self)
+        self.receiver_menu.aboutToShow.connect(self._build_receiver_menu)
+        self.receiver_btn = QToolButton()
+        self.receiver_btn.setText("⚙")
+        self.receiver_btn.setToolTip("Options for this receiver")
+        self.receiver_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.receiver_btn.setMenu(self.receiver_menu)
+
         conn_layout.addWidget(QLabel("Receiver:"))
         conn_layout.addWidget(self.ip_input, 1)
         conn_layout.addWidget(self.connect_btn)
+        conn_layout.addWidget(self.receiver_btn)
         conn_box.setLayout(conn_layout)
         layout.addWidget(conn_box)
 
@@ -923,10 +1012,7 @@ class DesktopCastApp(QMainWindow):
         # Input selector
         input_layout = QHBoxLayout()
         self.input_combo = QComboBox()
-        default_services = ["tidal", "spotify", "deezer", "qobuz", "amazon_music", 
-                          "napster", "server", "net_radio", "usb", "bluetooth"]
-        for svc in default_services:
-            self.input_combo.addItem(svc)
+        self.input_combo.addItems(DEFAULT_INPUTS)       # replaced by the receiver's own list
         
         self.set_input_btn = QPushButton("Set Input")
         self.set_input_btn.clicked.connect(self._change_input)
@@ -1108,6 +1194,8 @@ class DesktopCastApp(QMainWindow):
         """Tell the user what double-click does in the current mode"""
         if self.playlist_mode:
             self.mode_hint.setText("🎶 Double-click adds songs, albums and playlists · right-click for more")
+        elif self.api and not self.queue_enabled:
+            self.mode_hint.setText("Double-click plays · no play queue on this receiver (⚙ to change)")
         else:
             self.mode_hint.setText("Double-click plays now (the queue is kept) · right-click → Add to playlist")
 
@@ -1138,11 +1226,26 @@ class DesktopCastApp(QMainWindow):
         if not receivers:
             self.ip_input.setEditText(DEFAULT_IP)
 
-    def _remember_receiver(self, ip: str, device_id: str, model: str, name: str):
-        """Save this receiver as the most recent one (same device ID = same entry)"""
+    def _saved_receiver(self, ip: str, device_id: str) -> dict:
+        """The remembered entry of this receiver: same device ID, else same IP if that entry
+        isn't another device (the router may give a new receiver an old one's IP). {} if none."""
+        receivers = self._saved_receivers()
+        if device_id:
+            match = next((r for r in receivers if r.get("device_id") == device_id), None)
+            if match:
+                return match
+        return next((r for r in receivers if r.get("ip") == ip
+                     and (not device_id or not r.get("device_id"))), {})
+
+    def _remember_receiver(self, ip: str, device_id: str, model: str, name: str, **fields):
+        """Save this receiver as the most recent one (same device ID = same entry). The entry
+        keeps what was stored with it before (the ⚙ options, detected capabilities); fields
+        adds or changes some of those."""
+        entry = dict(self._saved_receiver(ip, device_id),
+                     ip=ip, device_id=device_id, model=model, name=name, **fields)
         receivers = [r for r in self._saved_receivers()
                      if r.get("ip") != ip and not (device_id and r.get("device_id") == device_id)]
-        receivers.insert(0, {"ip": ip, "device_id": device_id, "model": model, "name": name})
+        receivers.insert(0, entry)
         self.settings.setValue("receivers", json.dumps(receivers[:10]))
         self.settings.setValue("last_ip", ip)
         self.ip_input.blockSignals(True)
@@ -1174,14 +1277,17 @@ class DesktopCastApp(QMainWindow):
 
             device = api.get_device_info() or {}
             network = api.get_network_status() or {}
-            services = api.get_service_info()
+            caps = detect_capabilities(api, features)
             status = api.get_status()
             current_input = "tidal"
             if status and status.get('response_code') == 0:
                 current_input = status.get('input', 'tidal')
 
-            list_info = api.get_list_info(input_id=current_input, list_id="main", size=8)
-            return (api, features, device, network, services, status, list_info, current_input)
+            # Only inputs with menus have a list to show (not HDMI, the tuner...)
+            list_info = None
+            if dict(receiver_inputs(features)).get(current_input, True):
+                list_info = api.get_list_info(input_id=current_input, list_id="main", size=8)
+            return (api, features, device, network, caps, status, list_info, current_input)
 
         def on_connected(result):
             self.connect_btn.setEnabled(True)
@@ -1195,7 +1301,7 @@ class DesktopCastApp(QMainWindow):
                         "Check IP address and network.")
                 return
 
-            api, features, device, network, services, status, list_info, current_input = result
+            api, features, device, network, caps, status, list_info, current_input = result
             if self.events:
                 self.events.stop()
             self.api = api
@@ -1207,8 +1313,19 @@ class DesktopCastApp(QMainWindow):
             self.device_id = device.get('device_id', '')
             self.profile = resolve_profile(model, features)
             self._apply_volume_profile()
-            self._remember_receiver(ip, self.device_id, model, name)
+
+            # What this model supports, and the options remembered for this receiver. If the
+            # queue probe got no answer, the result seen last time stands in for it.
+            saved = self._saved_receiver(ip, self.device_id)
+            if caps["queue"] is None:
+                caps["queue"] = (saved.get("caps") or {}).get("queue")
+            self.caps = caps
+            self.queue_setting = saved.get("queue_setting", "auto")
+            self.receiver = {"ip": ip, "device_id": self.device_id, "model": model, "name": name}
+            stored_caps = {"queue": caps["queue"]} if caps["queue"] is not None else saved.get("caps", {})
+            self._remember_receiver(ip, self.device_id, model, name, caps=stored_caps)
             self.setWindowTitle(f"Desktopcast · {name or model or ip}")
+            self._apply_queue_capability()
 
             # Ask the receiver to push changes; keep fast polling until events show up
             self.events_seen = False
@@ -1219,19 +1336,11 @@ class DesktopCastApp(QMainWindow):
                 debug_print(f"[Event] Listener not started: {e}")
                 self.events = None
 
-            # Update input combo if we got service info
-            if services and services.get('response_code') == 0:
-                service_list = services.get('service_list', [])
-                if service_list:
-                    self.input_combo.clear()
-                    for svc in service_list:
-                        if isinstance(svc, dict):
-                            if svc.get('enable', True):
-                                service_id = svc.get('id') or svc.get('input', '')
-                                if service_id:
-                                    self.input_combo.addItem(service_id)
-                        elif isinstance(svc, str):
-                            self.input_combo.addItem(svc)
+            # The receiver's own inputs (HDMI, tuner and its services on an AV receiver...)
+            inputs = receiver_inputs(features)
+            self.input_browsable = dict(inputs)
+            self.input_combo.clear()
+            self.input_combo.addItems([input_id for input_id, _ in inputs] or DEFAULT_INPUTS)
 
             # Set current input
             self.current_input = current_input
@@ -1241,15 +1350,141 @@ class DesktopCastApp(QMainWindow):
 
             # Show power/volume right away, then the browse list
             self._apply_status_update({"status": status})
-            if list_info and list_info.get('response_code') == 0:
+            if not self._is_browsable(current_input):
+                self._show_not_browsable(current_input)
+            elif list_info and list_info.get('response_code') == 0:
                 self._update_browse_widget(list_info)
 
             # Start polling
             self.poll_timer.start(POLL_MS_WITHOUT_EVENTS)
             known = "" if self.profile["known"] else " (no profile for this model yet)"
-            self.status_label.setText(f"✅ Connected: {name or ip} · {self.profile['label']}{known}")
+            no_queue = "" if self.queue_enabled else " · no play queue (see ⚙)"
+            self.status_label.setText(
+                f"✅ Connected: {name or ip} · {self.profile['label']}{known}{no_queue}")
 
         self._run_in_background(do_connect, on_connected)
+
+    # =========================================================================
+    # MODEL DIFFERENCES (⚙ menu)
+    # =========================================================================
+
+    def _queue_state_text(self) -> str:
+        """Why the queue features are off, for tooltips"""
+        if self.queue_setting == "off":
+            return "The play queue is turned off for this receiver (⚙ to change)"
+        return ("This receiver has no play queue (it doesn't know the queue commands), so "
+                "Playlist Mode is off. ⚙ → Always on to try anyway.")
+
+    def _apply_queue_capability(self):
+        """Show or hide what needs the play queue, after connecting or a change in ⚙"""
+        enabled = self.queue_enabled
+        if not enabled and self.playlist_btn.isChecked():
+            self.playlist_btn.setChecked(False)           # leaves Playlist Mode
+        self.playlist_btn.setEnabled(enabled and self.api is not None)
+        self.playlist_btn.setToolTip(
+            "Show the queue beside the browser; double-click adds instead of playing"
+            if enabled else self._queue_state_text())
+        self._update_mode_hint()
+
+    def _set_queue_detected(self, supported: bool):
+        """Record what the receiver showed about its play queue (also for next time)"""
+        if supported is None or self.caps.get("queue") == supported:
+            return
+        self.caps["queue"] = supported
+        if self.receiver:
+            self._remember_receiver(**self.receiver, caps={"queue": supported})
+        self._apply_queue_capability()
+
+    def _build_receiver_menu(self):
+        """⚙ menu, built when opened so it shows the current receiver and choices"""
+        menu = self.receiver_menu
+        menu.clear()
+        if not self.api or not self.receiver:
+            menu.addAction("Connect to a receiver first").setEnabled(False)
+            return
+        title = self.receiver["name"] or self.receiver["ip"]
+        menu.addAction(f"{title} · {self.profile['label']}").setEnabled(False)
+        menu.addSeparator()
+
+        detected = {True: "supported", False: "not supported", None: "unknown"}[self.caps.get("queue")]
+        menu.addAction(f"Play queue / Playlist Mode (detected: {detected})").setEnabled(False)
+        if getattr(self, "_queue_choice_group", None) is not None:
+            self._queue_choice_group.deleteLater()      # the previous opening's group
+        group = self._queue_choice_group = QActionGroup(menu)
+        for key, label in QUEUE_SETTINGS.items():
+            action = menu.addAction(f"    {label}")
+            action.setCheckable(True)
+            action.setChecked(self.queue_setting == key)
+            group.addAction(action)
+            action.triggered.connect(lambda _checked=False, k=key: self._set_queue_setting(k))
+
+        menu.addSeparator()
+        menu.addAction("📋 Copy receiver details (for a bug report)").triggered.connect(
+            self._copy_receiver_details)
+
+    def _set_queue_setting(self, setting: str):
+        """⚙ choice for the play queue, remembered with this receiver"""
+        self.queue_setting = setting
+        if self.receiver:
+            self._remember_receiver(**self.receiver, queue_setting=setting)
+        self._apply_queue_capability()
+        self.status_label.setText(f"⚙ Play queue: {QUEUE_SETTINGS[setting]}")
+        if setting == "auto":
+            # Detect again: the receiver may have been off or busy last time
+            api = self.api
+            self._run_in_background(
+                lambda: api.probe("/netusb/getPlayQueue", {"index": 0, "size": 8}),
+                self._set_queue_detected)
+
+    def _copy_receiver_details(self):
+        """Copy what the receiver says about itself (model, firmware, features, what was
+        detected) to paste in a GitHub issue. Its device IDs and network details are left out."""
+        api, caps, setting, input_id = self.api, dict(self.caps), self.queue_setting, self.current_input
+        self.status_label.setText("📋 Reading the receiver's details...")
+
+        def collect():
+            device = api.get_device_info() or {}
+            for key in ("device_id", "system_id", "serial_number"):
+                device.pop(key, None)
+            return {
+                "app": "Desktopcast",
+                "device_info": device,
+                "features": api.get_features(),
+                "status": api.get_status(),
+                "play_info": api.get_play_info(),
+                "play_queue_probe": api.probe("/netusb/getPlayQueue", {"index": 0, "size": 8}),
+                f"menu ({input_id})": api.get_list_info(input_id=input_id, size=8),
+                "detected": caps,
+                "queue_setting": setting,
+            }
+
+        def done(details):
+            if not details:
+                self.status_label.setText("❌ Could not read the receiver's details")
+                return
+            QApplication.clipboard().setText(json.dumps(details, indent=1))
+            self.status_label.setText("📋 Receiver details copied: paste them in a GitHub issue")
+
+        self._run_in_background(collect, done)
+
+    def _show_not_browsable(self, input_id: str):
+        """Browser for an input without menus (HDMI, tuner, AirPlay...)"""
+        self.pending_thumbnails.clear()
+        self.list_widget.clear()
+        self.list_widget.addItem(f"🎛 “{input_id}” has no menus to browse.")
+        self.list_widget.addItem("Pick a streaming service, Net Radio, Server or USB to browse music.")
+        self.current_view = "browse"
+        self.current_menu_layer = 0
+        self.current_menu_name = input_id
+        self.back_btn.setEnabled(False)
+        self.status_label.setText(f"🎛 Input: {input_id}")
+
+    def _check_browsable(self) -> bool:
+        """For browse actions: True if the current input has menus, else say so"""
+        if self._is_browsable(self.current_input):
+            return True
+        self._show_not_browsable(self.current_input)
+        return False
 
     # =========================================================================
     # BASIC CONTROLS
@@ -1395,16 +1630,21 @@ class DesktopCastApp(QMainWindow):
         self.set_input_btn.setEnabled(False)
         self.set_input_btn.setText("Switching...")
         self._note_action(f"switched input to {input_id}")
+        browsable = self._is_browsable(input_id)
 
         def switch_input():
             self.api.set_input(input_id)
+            if not browsable:
+                return None
             time.sleep(1.5)
             return self.api.get_list_info(input_id=input_id, list_id="main", size=8)
 
         def on_switched(list_info):
             self.set_input_btn.setEnabled(True)
             self.set_input_btn.setText("Set Input")
-            if list_info and list_info.get('response_code') == 0:
+            if not browsable:
+                self._show_not_browsable(input_id)
+            elif list_info and list_info.get('response_code') == 0:
                 self.last_location_hash = ""
                 self._update_browse_widget(list_info)
 
@@ -1534,7 +1774,7 @@ class DesktopCastApp(QMainWindow):
 
     def _go_home(self):
         """Go to home/root menu"""
-        if not self.api or self.locating is not None:
+        if not self.api or self.locating is not None or not self._check_browsable():
             return
         self.current_view = "browse"
         self.accumulated_items = []
@@ -1610,6 +1850,9 @@ class DesktopCastApp(QMainWindow):
         """Force refresh - fetches current state including play queue for album tracks"""
         if not self.api or self.locating is not None:
             return
+        if not self._check_browsable():
+            self._refresh_playlist()
+            return
         
         self.current_view = "browse"
         self.status_label.setText("🔄 Refreshing...")
@@ -1647,7 +1890,7 @@ class DesktopCastApp(QMainWindow):
 
     def _do_search(self):
         """Perform search"""
-        if not self.api or self.locating is not None:
+        if not self.api or self.locating is not None or not self._check_browsable():
             return
         
         search_text = self.search_input.text().strip()
@@ -1979,20 +2222,22 @@ class DesktopCastApp(QMainWindow):
         if item_type == "recent":
             idx = data.get("index", 0)
             text = data.get("data", {}).get("text", "")
-            if not self._confirm_replace_queue(text):
-                return
-            debug_print(f"Playing recent item {idx}")
-            self._note_action(f"played recent item '{text}'")
-            self._run_in_background(lambda: self.api.play_recent(idx))
+
+            def play_recent():
+                debug_print(f"Playing recent item {idx}")
+                self._note_action(f"played recent item '{text}'")
+                self._run_in_background(lambda: self.api.play_recent(idx))
+            self._play_after_confirm(text, play_recent)
 
         elif item_type == "preset":
             num = data.get("num", 1)
             text = data.get("data", {}).get("text", "")
-            if not self._confirm_replace_queue(text):
-                return
-            debug_print(f"Playing preset {num}")
-            self._note_action(f"played preset {num} '{text}'")
-            self._run_in_background(lambda: self.api.recall_preset(num))
+
+            def play_preset():
+                debug_print(f"Playing preset {num}")
+                self._note_action(f"played preset {num} '{text}'")
+                self._run_in_background(lambda: self.api.recall_preset(num))
+            self._play_after_confirm(text, play_preset)
 
         elif item_type == "track":
             # Track from track_info (album contents / play queue)
@@ -2036,8 +2281,8 @@ class DesktopCastApp(QMainWindow):
 
             # Normal mode: songs play right away *through the queue* (inserted after the
             # current track), so the queue is kept. A plain play would make the receiver play
-            # straight from this list and drop its queue.
-            if is_playable and not is_container:
+            # straight from this list and drop its queue. Without a queue: plain play.
+            if is_playable and not is_container and self.queue_enabled:
                 if self._is_queueable(data) and attr & ATTR_PLAY_NOW:
                     self._queue_item(idx, text, "now")
                     return
@@ -2072,8 +2317,7 @@ class DesktopCastApp(QMainWindow):
             elif attr in track_attrs or is_playable:
                 # Playable but not through the queue (radio, other sources): plain play
                 debug_print(f"  -> Playable track (attr={attr}), playing")
-                if self._confirm_replace_queue(text):
-                    self._play_track(idx, text)
+                self._play_after_confirm(text, lambda: self._play_track(idx, text))
             elif attr > 0 and not is_container and not is_playable:
                 # Unknown positive attribute - use context
                 debug_print(f"  -> Unknown attr={attr}, trying navigate")
@@ -2303,36 +2547,44 @@ class DesktopCastApp(QMainWindow):
         (Search-result songs can't be: the receiver accepts them but then won't play them.)"""
         return bool(data.get("attribute", 0) & ATTR_ADD_PLAY_QUEUE)
 
-    def _queue_size(self) -> int:
-        """Tracks in the receiver's queue (0 when it plays straight from a list)"""
+    def _play_after_confirm(self, text: str, play, reason: str = ""):
+        """Run play() for a plain play (recent item, preset, radio...): the receiver then plays
+        straight from that list and drops its queue for good, so ask first if the queue has
+        tracks. The count is read in the background, so a slow receiver doesn't freeze the
+        window. No queue on this receiver (or turned off): nothing to lose, play right away."""
+        if not self.api or not self.queue_enabled:
+            play()
+            return
         if self.playlist_mode and self.playlist_texts is not None:
-            return len(self.playlist_texts)
-        queue = self.api.get_play_queue(size=8) or {}
-        if queue.get("type") != "user":
-            return 0
-        return queue.get("max_line") or 0
+            self._ask_then_play(text, self.queue_count if self.queue_mode == "user" else 0, play, reason)
+            return
+        api = self.api
 
-    def _confirm_replace_queue(self, text: str, reason: str = "") -> bool:
-        """Ask before a plain play (recent item, preset, radio...): the receiver then plays
-        straight from that list and drops its queue for good. No question if it's empty."""
-        count = self._queue_size() if self.api else 0
-        if not count:
-            return True
-        answer = QMessageBox.question(
-            self, "Drop the playlist?",
-            f"{reason}This plays “{text}” straight from the list, and the receiver then "
-            f"drops its queue ({count} tracks); it can't be brought back.\n\nPlay it anyway?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No)
-        if answer != QMessageBox.StandardButton.Yes:
-            return False
-        self.playlist_texts = None          # the user chose this; don't report it as a wipe
-        return True
+        def count():
+            queue = api.get_play_queue(size=8) or {}
+            return (queue.get("max_line") or 0) if queue.get("type") == "user" else 0
+
+        self._run_in_background(count, lambda n: self._ask_then_play(text, n or 0, play, reason))
+
+    def _ask_then_play(self, text: str, count: int, play, reason: str = ""):
+        """Second half of _play_after_confirm: ask if count tracks would be dropped, then play"""
+        if count:
+            answer = QMessageBox.question(
+                self, "Drop the playlist?",
+                f"{reason}This plays “{text}” straight from the list, and the receiver then "
+                f"drops its queue ({count} tracks); it can't be brought back.\n\nPlay it anyway?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+            self.playlist_texts = None          # the user chose this; don't report it as a wipe
+        play()
 
     def _locatable_song(self, data: dict) -> str:
         """Cover URL of a song the receiver can't queue directly (a search result) but the
-        app can look up in its artist's top tracks or album; "" otherwise"""
-        if data.get("is_playable") and not self._is_queueable(data):
+        app can look up in its artist's top tracks or album; "" otherwise (always "" without
+        a play queue: finding it is only useful to queue it)"""
+        if self.queue_enabled and data.get("is_playable") and not self._is_queueable(data):
             cover = data.get("thumbnail", "")
             if cover_id(cover):
                 return cover
@@ -2351,7 +2603,7 @@ class DesktopCastApp(QMainWindow):
         cover = self._locatable_song(data)   # set for search songs: found in their album first
         menu = QMenu(self)
 
-        if self._is_queueable(data) or cover:
+        if self.queue_enabled and (self._is_queueable(data) or cover):
             menu.addAction("➕ Add to playlist").triggered.connect(
                 lambda: self._queue_item(idx, text, "add", cover))
             if cover or attr & ATTR_PLAY_NEXT:
@@ -2361,8 +2613,10 @@ class DesktopCastApp(QMainWindow):
                 menu.addAction("▶ Play now, keep the playlist").triggered.connect(
                     lambda: self._queue_item(idx, text, "now", cover))
         if data.get("is_playable"):
-            menu.addAction("▶ Play straight from this list (drops the queue)").triggered.connect(
-                lambda: self._confirm_replace_queue(text) and self._play_track(idx, text))
+            label = ("▶ Play straight from this list (drops the queue)" if self.queue_enabled
+                     else "▶ Play")
+            menu.addAction(label).triggered.connect(
+                lambda: self._play_after_confirm(text, lambda: self._play_track(idx, text)))
         if data.get("is_container"):
             menu.addSeparator()
             menu.addAction("📂 Open").triggered.connect(
@@ -2403,8 +2657,9 @@ class DesktopCastApp(QMainWindow):
         """Put a navigator item in the receiver's queue: "add" (at the end), "next" (after the
         current track) or "now" (there, and play it). With a cover, the item is a search song:
         it's first found in its album or artist's top tracks, where the receiver can queue it.
-        If the receiver plays straight from a list it has no queue: the item starts a new one."""
-        if not self.api or self.locating is not None or self.clearing:
+        If the receiver plays straight from a list it has no queue: the item starts a new one.
+        If "now" can't go through the queue, it's played straight from the list instead."""
+        if not self.api or self.locating is not None or self.clearing or not self.queue_enabled:
             return
         if cover and self.menu_busy:
             self.status_label.setText("⏳ The browser is still loading; try again in a moment.")
@@ -2416,19 +2671,21 @@ class DesktopCastApp(QMainWindow):
         self._set_playlist_warning("")
         self.status_label.setText(f"{'▶️ Starting' if how == 'now' else '➕ Adding'}: {text}...")
         self._show_pending(f"{'🔎' if cover else '⏳'} {text}")
-        api, input_id = self.api, self.current_input
+        api, input_id, limit = self.api, self.current_input, self.queue_limit
         if cover:
             self._lock_browser(True)
 
         def do_queue():
             queue = api.get_play_queue(size=8) or {}
+            if queue.get("response_code") == 3:
+                return None, "no_queue", None       # the receiver doesn't know the queue commands
             mode = queue.get("type") or self.queue_mode or "user"
             count = (queue.get("max_line") or 0) if mode == "user" else 0
             if how == "now" or mode == "system":
                 operation = "play_now"
             else:
                 operation = "play_next" if how == "next" else "add_to_queue"
-            if count >= QUEUE_LIMIT:
+            if count >= limit:
                 playing = queue.get("playing_index")
                 if operation == "play_now" and isinstance(playing, int) and playing > 0:
                     # Playing something now with a full queue: drop the oldest played track
@@ -2449,10 +2706,20 @@ class DesktopCastApp(QMainWindow):
                 self._lock_browser(False)
             operation, result, where = outcome or (None, None, None)
             found = f" (from {where})" if where else ""
-            if result == "full":
+            if result == "no_queue":
+                # Learned now (e.g. the probe at connection got no answer): stop offering it
+                self.playlist_pending.clear()
+                self.playlist_signature = None
+                self._set_queue_detected(False)
+                if how == "now":
+                    self._play_track(index, text)
+                else:
+                    self.status_label.setText(f"⚠️ This receiver has no play queue: “{text}” "
+                                              f"can't be added (⚙ to change).")
+            elif result == "full":
                 self.playlist_pending.clear()
                 self.status_label.setText(
-                    f"⚠️ The queue is full ({QUEUE_LIMIT} tracks, the receiver's limit). "
+                    f"⚠️ The queue is full ({limit} tracks, the receiver's limit). "
                     f"Remove some tracks or press 🧹 Clear.")
                 self.playlist_signature = None
             elif result and result.get("response_code") == 0:
@@ -2470,11 +2737,17 @@ class DesktopCastApp(QMainWindow):
             else:
                 self.playlist_pending.clear()
                 self.playlist_signature = None
-                if cover and not where and how == "now":
-                    self.status_label.setText(f"⚠️ Couldn't find “{text}” in an album the queue can use.")
-                    if self._confirm_replace_queue(text, "It isn't in its album or its artist's top "
-                                                         "tracks, so it can't go through the queue. "):
-                        self._play_track(index, text)
+                if how == "now":
+                    # A double-click must play something: straight from the list, if the queue
+                    # can't take it (asking first if that drops a queue with tracks)
+                    if cover and not where:
+                        self.status_label.setText(f"⚠️ Couldn't find “{text}” in an album the queue can use.")
+                        reason = ("It isn't in its album or its artist's top tracks, "
+                                  "so it can't go through the queue. ")
+                    else:
+                        self.status_label.setText(f"⚠️ The receiver didn't take “{text}” into its queue.")
+                        reason = "The receiver didn't take it into its queue. "
+                    self._play_after_confirm(text, lambda: self._play_track(index, text), reason)
                 elif cover and not where:
                     self.status_label.setText(
                         f"❌ Couldn't find “{text}” in its album or its artist's top tracks. "
@@ -2511,12 +2784,29 @@ class DesktopCastApp(QMainWindow):
                 or self.locating is not None or self.clearing):
             return
         self.playlist_loading = True
-        api = self.api
+        api, limit = self.api, self.queue_limit
 
-        threading.Thread(
-            target=lambda: self.update_playlist_signal.emit(api.get_play_queue(size=200)),
-            daemon=True
-        ).start()
+        def fetch():
+            data = None
+            try:
+                data = api.get_play_queue(size=limit)
+                tracks = (data or {}).get("track_info")
+                if data and data.get("response_code") == 0 and isinstance(tracks, list):
+                    # Some receivers send at most a page (8 entries) per read: read on
+                    total = min(data.get("max_line") or 0, limit)
+                    while len(tracks) < total:
+                        page = api.get_play_queue(size=limit, index=len(tracks)) or {}
+                        more = page.get("track_info")
+                        if page.get("response_code") != 0 or not more or not isinstance(more, list):
+                            break
+                        tracks.extend(more)
+            except Exception as e:
+                debug_print(f"[Playlist] {type(e).__name__}: {e}")
+            finally:
+                # Always answer, so the panel can't be left "loading" for good
+                self.update_playlist_signal.emit(data)
+
+        threading.Thread(target=fetch, daemon=True).start()
 
     def _set_playlist_warning(self, text: str):
         """Show (or clear) the wiped-queue warning above the playlist"""
@@ -2554,16 +2844,22 @@ class DesktopCastApp(QMainWindow):
     def _update_playlist_widget(self, data: dict):
         """Show the play queue in the playlist panel, keeping selection and scroll"""
         self.playlist_loading = False
+        if data and data.get('response_code') == 3 and self.queue_setting == "auto":
+            self._set_queue_detected(False)     # unknown command: this receiver has no queue
+            return
         if not data or data.get('response_code') != 0:
             self.playlist_info.setText("❌ Could not load the queue (receiver busy?), retrying...")
             return
 
-        texts = [t.get('track', t.get('text', '???')) for t in data.get('track_info', [])]
+        texts = [t.get('track', t.get('text', '???')) for t in data.get('track_info') or []
+                 if isinstance(t, dict)]
         playing_idx = data.get('playing_index', -1)
         mode = data.get('type', 'user')
         # In standby the receiver sometimes reports no queue at all: nothing to compare then
         standby = self.power_state == "standby" and not texts
         self.queue_mode = mode
+        self.queue_count = (data.get('max_line') or len(texts)) if mode == "user" else 0
+        limit = self.queue_limit
 
         # Pending adds disappear once the receiver lists a change (or after 20 s)
         if self.playlist_texts is not None and texts != self.playlist_texts:
@@ -2583,11 +2879,11 @@ class DesktopCastApp(QMainWindow):
                     "a recent item or a preset), "
                     "so there's no queue to show. The first song or album you add starts a "
                     "new playlist and plays it.")
-        elif len(texts) >= QUEUE_LIMIT:
-            info = (f"⚠️ The queue is full ({len(texts)} tracks, the receiver's limit): adding "
+        elif self.queue_count >= limit:
+            info = (f"⚠️ The queue is full ({self.queue_count} tracks, the receiver's limit): adding "
                     f"does nothing until you remove some tracks or press 🧹 Clear.")
         else:
-            info = (f"{len(texts)}/{QUEUE_LIMIT} tracks · double-click a song, album or "
+            info = (f"{self.queue_count}/{limit} tracks · double-click a song, album or "
                     f"playlist in the browser to add it")
             if not self.profile.get("queue_editing"):
                 info += " · queue editing is untested on this model"
@@ -2676,7 +2972,7 @@ class DesktopCastApp(QMainWindow):
         by one from the end (about 25 ms each: a full queue of 200 takes ~5 s)."""
         if not self.api or self.clearing or self.locating is not None:
             return
-        count = len(self.playlist_texts or [])
+        count = (self.queue_count if self.queue_mode == "user" else 0) or len(self.playlist_texts or [])
         if not count:
             self.status_label.setText("The playlist is already empty")
             return
@@ -2759,7 +3055,7 @@ class DesktopCastApp(QMainWindow):
 
         api = self.api
         input_id = self.current_input
-        if self.skip_list_update or self.list_fully_loaded:
+        if self.skip_list_update or self.list_fully_loaded or not self._is_browsable(input_id):
             fetch_idx = -1
         else:
             fetch_idx = len(self.accumulated_items)

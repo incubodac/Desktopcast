@@ -38,6 +38,7 @@ Desktopcast is my answer to this problem: a lightweight, open-source desktop con
 - ⭐ **Presets** - Save and recall your favorite stations/playlists
 - 🖼️ **Album Art** - Beautiful thumbnail display for your music
 - 📡 **Remembered Receivers** - Reconnects to the last receiver at startup; each receiver is listed by room name and model
+- 🧩 **Adapts to your model** - Lists the receiver's own inputs (HDMI and tuner on an AV receiver, its own streaming services) and checks whether it has a play queue; Playlist Mode is only offered where it works, and ⚙ lets you override that per receiver
 - 🔄 **Live Updates** - The receiver pushes changes (volume, track, play time) to the app, with polling as a fallback
 
 ## 📸 Screenshots
@@ -49,10 +50,11 @@ Desktopcast is my answer to this problem: a lightweight, open-source desktop con
 > **Note:** This project is in active development.
 
 - ✅ **Tested on:** Yamaha R-N602 (has a model profile: dB volume scale and tested queue editing)
+- 🧩 **Other models:** the app detects what your receiver supports when it connects. Older models (e.g. RX-V receivers that got MusicCast through a firmware update) may have no play queue: then double-click plays songs directly and Playlist Mode is switched off
 - ⚠️ **Streaming services:** Tidal is fully functional; other services (Spotify, Deezer, Qobuz, etc.) may have limited functionality
 - 🔄 **Coming soon:** Support for additional Yamaha models and potentially other receiver brands
 
-If you have a different Yamaha model and want to help test, please [open an issue](https://github.com/incubodac/Desktopcast/issues) with your model name and any compatibility notes!
+If you have a different Yamaha model and want to help test, please [open an issue](https://github.com/incubodac/Desktopcast/issues) with your model name and what works or not. Click **⚙ → Copy receiver details** and paste the result in the issue: it shows what your receiver supports (its device IDs and network details are left out).
 
 ## 🚀 Installation
 
@@ -99,6 +101,7 @@ Pre-built binaries for Windows, macOS, and Linux will be available in the [Relea
    - Enter your Yamaha receiver's IP address
    - Click "Connect"
    - Next time the app reconnects by itself; other receivers you used are in the dropdown
+   - ⚙ holds options for the connected receiver (see [Configuration](#-configuration))
 
 2. **Control playback**
    - Use the transport controls (play, pause, previous, next)
@@ -126,6 +129,14 @@ Pre-built binaries for Windows, macOS, and Linux will be available in the [Relea
 The first time, the receiver field suggests `192.168.0.248`. After a successful connection the receiver is remembered (by its device ID, so a new IP from your router updates the same entry).
 
 The app asks the receiver to push changes to it over UDP. If your firewall asks whether Python may accept incoming connections, allowing it makes updates instant; if you deny it, the app falls back to polling.
+
+**Per-receiver options (⚙ next to Connect):**
+- **Play queue / Playlist Mode:** *Auto* uses what was detected when connecting (the app asks the receiver for its queue; a receiver that doesn't know the command has none). *Always on* tries the queue features anyway; *Off* makes double-click play songs directly, like on a receiver without a queue. Choosing *Auto* again re-checks the receiver.
+- **Copy receiver details:** model, firmware, features and what was detected, to paste in a bug report.
+
+Options are remembered per receiver, together with the last detection result (used if the receiver doesn't answer the check next time). They are stored with the remembered receivers, by device ID, so they survive a new IP address. The storage is the OS's usual place: `~/Library/Preferences/com.desktopcast.Desktopcast.plist` on macOS, the registry under `HKEY_CURRENT_USER\Software\Desktopcast\Desktopcast` on Windows, `~/.config/Desktopcast/Desktopcast.conf` on Linux.
+
+**Inputs:** the input list is the receiver's own. Inputs without menus (HDMI, tuner, AirPlay...) can be selected; the browser then says there's nothing to browse.
 
 **Model profiles:** `MODEL_PROFILES` in `main.py` holds per-model settings (dB scale, loud zone, tested features). The R-N602 doesn't report volume in dB, so the app shows `−80.5 + 0.5 × volume` (volume 92 = −34.5 dB). Other models use the dB range the receiver reports, or the same Yamaha convention when the volume goes 0–161.
 
